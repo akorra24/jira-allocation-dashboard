@@ -91,15 +91,19 @@ SAMPLE_ISSUES = [
 class JiraSettings:
     """Connection details loaded from environment variables."""
 
-    base_url: str = config.JIRA_BASE_URL
+    base_url: str = config.get_jira_base_url()
     email: str = config.JIRA_EMAIL
     api_token: str = config.JIRA_API_TOKEN
     project_key: str = config.JIRA_PROJECT_KEY
+    board_id: str = config.JIRA_BOARD_ID
     verify_ssl: bool = config.JIRA_VERIFY_SSL
+    story_points_field: str = config.STORY_POINTS_FIELD
+    sprint_field: str = config.SPRINT_FIELD
+    epic_field: str = config.EPIC_FIELD
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.base_url and self.email and self.api_token)
+        return config.has_jira_credentials()
 
 
 class JiraClient:
@@ -125,15 +129,15 @@ class JiraClient:
             "issuetype",
             "status",
             "assignee",
-            "customfield_10016",
-            "parent",
-            "sprint",
+            self.settings.story_points_field,
+            self.settings.epic_field,
+            self.settings.sprint_field,
         ]
         jql_parts = []
         if self.settings.project_key:
             jql_parts.append(f"project = {self.settings.project_key}")
         if sprint_name:
-            jql_parts.append(f'Sprint = "{sprint_name}"')
+            jql_parts.append(f'"{self.settings.sprint_field}" = "{sprint_name}"')
 
         jql = " AND ".join(jql_parts) if jql_parts else "ORDER BY updated DESC"
         url = f"{self.settings.base_url}/rest/api/3/search"
@@ -167,10 +171,9 @@ class JiraClient:
 
         return collected
 
-    @staticmethod
-    def _normalize_issue(issue: dict[str, Any], sprint_name: str | None) -> dict[str, Any]:
+    def _normalize_issue(self, issue: dict[str, Any], sprint_name: str | None) -> dict[str, Any]:
         fields = issue.get("fields", {})
-        parent = fields.get("parent") or {}
+        parent = fields.get(self.settings.epic_field) or {}
         parent_fields = parent.get("fields", {})
         assignee = fields.get("assignee") or {}
 
@@ -183,7 +186,7 @@ class JiraClient:
             "epic_name": parent_fields.get("summary", ""),
             "status": (fields.get("status") or {}).get("name", ""),
             "assignee": assignee.get("displayName", "Unassigned"),
-            "story_points": fields.get("customfield_10016") or 0,
+            "story_points": fields.get(self.settings.story_points_field) or 0,
             "allocation_category": "",
         }
 

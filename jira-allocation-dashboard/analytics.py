@@ -38,7 +38,7 @@ def load_sprint_targets(path: Path = config.SPRINT_TARGETS_PATH) -> pd.DataFrame
         targets = pd.DataFrame(
             {
                 "allocation_category": list(config.ALLOCATION_TARGETS.keys()),
-                "target_percentage": [value * 100 for value in config.ALLOCATION_TARGETS.values()],
+                "target_percentage": list(config.ALLOCATION_TARGETS.values()),
             }
         )
 

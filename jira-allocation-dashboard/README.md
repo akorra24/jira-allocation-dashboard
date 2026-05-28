@@ -46,27 +46,42 @@ jira-allocation-dashboard/
 
 ## Setup
 
+1. Create a virtual environment:
+
 ```bash
 cd jira-allocation-dashboard
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
+```
+
+2. Install requirements:
+
+```bash
 pip install -r requirements.txt
+```
+
+3. Copy `.env.example` to `.env`:
+
+```bash
 cp .env.example .env
 ```
 
-Edit `.env` with Jira credentials if you want live Jira data:
+4. Add Jira credentials to `.env`:
 
 ```dotenv
 JIRA_BASE_URL=https://your-domain.atlassian.net
 JIRA_EMAIL=your-email@example.com
 JIRA_API_TOKEN=your-api-token
 JIRA_PROJECT_KEY=ECOMM
-JIRA_DEFAULT_SPRINT=Your Sprint Name
+JIRA_BOARD_ID=123
+STORY_POINTS_FIELD=customfield_10016
+SPRINT_FIELD=Sprint
+EPIC_FIELD=parent
 ```
 
 Do not commit `.env`; it is ignored by git.
 
-## Run
+5. Run the Streamlit app:
 
 ```bash
 streamlit run app.py
