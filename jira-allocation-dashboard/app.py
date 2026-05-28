@@ -48,7 +48,7 @@ apply_page_styles()
 def main() -> None:
     render_header()
 
-    page, sprint_name, dashboard_filters = render_sidebar()
+    page, sprint_name, dashboard_filters, use_sample_data = render_sidebar()
     if page == "Jira Field Discovery":
         render_jira_field_discovery_page()
         return
@@ -59,7 +59,7 @@ def main() -> None:
         return
 
     render_story_points_warning()
-    raw_issues = load_issues(sprint_name)
+    raw_issues = load_issues(sprint_name, use_sample_data)
     mapping = analytics.load_allocation_mapping()
     targets = analytics.load_sprint_targets()
     mapped_issues = analytics.apply_allocation_mapping(raw_issues, mapping)
@@ -107,7 +107,7 @@ def render_ticket_mapping_page(default_sprint_name: str) -> None:
         help="Used to pull Jira tickets. If Jira is unavailable, sample sprint tickets are shown.",
         key="ticket_mapping_sprint_name",
     )
-    raw_issues = load_issues(sprint_name)
+    raw_issues = load_issues(sprint_name, st.session_state.get("use_sample_cheeseburger_data", False))
     mapping = analytics.load_allocation_mapping()
     mapped_issues = analytics.apply_allocation_mapping(raw_issues, mapping)
     editor_rows = ticket_mapping_editor_rows(mapped_issues, mapping)
@@ -195,7 +195,7 @@ def render_header() -> None:
     )
 
 
-def render_sidebar() -> tuple[str, str, dict[str, object]]:
+def render_sidebar() -> tuple[str, str, dict[str, object], bool]:
     settings = JiraSettings()
     dashboard_filters: dict[str, object] = {
         "categories": analytics.VALID_ALLOCATION_CATEGORIES,
@@ -211,8 +211,14 @@ def render_sidebar() -> tuple[str, str, dict[str, object]]:
         st.header("Sprint controls")
         sprint_name = st.text_input(
             "Sprint name",
-            value=config.JIRA_DEFAULT_SPRINT or "Sample Sprint 24.10",
+            value=config.JIRA_DEFAULT_SPRINT or "S215",
             help="Used in the Jira JQL sprint filter when Jira credentials are configured.",
+        )
+        use_sample_data = st.checkbox(
+            "Use sample Cheeseburger sprint data",
+            value=not settings.is_configured,
+            help="Use realistic S215 sample data to test the dashboard without Jira.",
+            key="use_sample_cheeseburger_data",
         )
 
         if page == "Dashboard":
@@ -244,12 +250,12 @@ def render_sidebar() -> tuple[str, str, dict[str, object]]:
             st.success("Jira credentials detected.")
             st.caption(settings.base_url)
         else:
-            st.info("Jira is not configured. The dashboard is using bundled sample data.")
+            st.info("Jira is not configured. Enable the sample checkbox above to use bundled S215 data.")
 
         st.caption("Set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env to enable live Jira data.")
         st.metric("Sprint capacity", f"{config.SPRINT_CAPACITY_POINTS} pts")
 
-    return page, sprint_name, dashboard_filters
+    return page, sprint_name, dashboard_filters, use_sample_data
 
 
 def render_story_points_warning() -> None:
@@ -317,13 +323,16 @@ def render_jira_field_discovery_page() -> None:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_issues(sprint_name: str) -> pd.DataFrame:
+def load_issues(sprint_name: str, use_sample_data: bool = False) -> pd.DataFrame:
+    if use_sample_data:
+        return sample_issues("S215")
+
     client = JiraClient()
     try:
         return pd.DataFrame(client.get_issues_for_sprint(sprint_name))
     except JiraClientError as exc:
         st.warning(f"Jira request failed, using sample data instead: {exc}")
-        return sample_issues(sprint_name)
+        return sample_issues("S215")
 
 
 def render_connection_result(result: dict | None) -> None:
