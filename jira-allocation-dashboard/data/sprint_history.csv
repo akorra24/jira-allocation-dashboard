@@ -1,0 +1,25 @@
+sprint,sprint_start_date,category,target_percent,target_story_points,actual_story_points,actual_percent_of_capacity,variance_percent,variance_story_points,total_sprint_story_points,capacity_used_percent,generated_at
+Sample Sprint 24.07,2026-04-06,Product/BPL,45,24.75,23,41.82,-3.18,-1.75,50,90.91,2026-05-28T23:35:00Z
+Sample Sprint 24.07,2026-04-06,Product/Non-BPL,0,0,0,0,0,0,50,90.91,2026-05-28T23:35:00Z
+Sample Sprint 24.07,2026-04-06,ETO System Feature,10,5.5,6,10.91,0.91,0.5,50,90.91,2026-05-28T23:35:00Z
+Sample Sprint 24.07,2026-04-06,Marketing,35,19.25,16,29.09,-5.91,-3.25,50,90.91,2026-05-28T23:35:00Z
+Sample Sprint 24.07,2026-04-06,ETO System Maintenance,5,2.75,2,3.64,-1.36,-0.75,50,90.91,2026-05-28T23:35:00Z
+Sample Sprint 24.07,2026-04-06,Security,5,2.75,3,5.45,0.45,0.25,50,90.91,2026-05-28T23:35:00Z
+Sample Sprint 24.08,2026-04-20,Product/BPL,45,24.75,26,47.27,2.27,1.25,58,105.45,2026-05-28T23:35:00Z
+Sample Sprint 24.08,2026-04-20,Product/Non-BPL,0,0,0,0,0,0,58,105.45,2026-05-28T23:35:00Z
+Sample Sprint 24.08,2026-04-20,ETO System Feature,10,5.5,5,9.09,-0.91,-0.5,58,105.45,2026-05-28T23:35:00Z
+Sample Sprint 24.08,2026-04-20,Marketing,35,19.25,21,38.18,3.18,1.75,58,105.45,2026-05-28T23:35:00Z
+Sample Sprint 24.08,2026-04-20,ETO System Maintenance,5,2.75,3,5.45,0.45,0.25,58,105.45,2026-05-28T23:35:00Z
+Sample Sprint 24.08,2026-04-20,Security,5,2.75,3,5.45,0.45,0.25,58,105.45,2026-05-28T23:35:00Z
+Sample Sprint 24.09,2026-05-04,Product/BPL,45,24.75,22,40,-5,-2.75,53,96.36,2026-05-28T23:35:00Z
+Sample Sprint 24.09,2026-05-04,Product/Non-BPL,0,0,0,0,0,0,53,96.36,2026-05-28T23:35:00Z
+Sample Sprint 24.09,2026-05-04,ETO System Feature,10,5.5,7,12.73,2.73,1.5,53,96.36,2026-05-28T23:35:00Z
+Sample Sprint 24.09,2026-05-04,Marketing,35,19.25,18,32.73,-2.27,-1.25,53,96.36,2026-05-28T23:35:00Z
+Sample Sprint 24.09,2026-05-04,ETO System Maintenance,5,2.75,3,5.45,0.45,0.25,53,96.36,2026-05-28T23:35:00Z
+Sample Sprint 24.09,2026-05-04,Security,5,2.75,3,5.45,0.45,0.25,53,96.36,2026-05-28T23:35:00Z
+Sample Sprint 24.10,2026-05-18,Product/BPL,45,24.75,21,38.18,-6.82,-3.75,39,70.91,2026-05-28T23:35:00Z
+Sample Sprint 24.10,2026-05-18,Product/Non-BPL,0,0,0,0,0,0,39,70.91,2026-05-28T23:35:00Z
+Sample Sprint 24.10,2026-05-18,ETO System Feature,10,5.5,5,9.09,-0.91,-0.5,39,70.91,2026-05-28T23:35:00Z
+Sample Sprint 24.10,2026-05-18,Marketing,35,19.25,8,14.55,-20.45,-11.25,39,70.91,2026-05-28T23:35:00Z
+Sample Sprint 24.10,2026-05-18,ETO System Maintenance,5,2.75,2,3.64,-1.36,-0.75,39,70.91,2026-05-28T23:35:00Z
+Sample Sprint 24.10,2026-05-18,Security,5,2.75,3,5.45,0.45,0.25,39,70.91,2026-05-28T23:35:00Z

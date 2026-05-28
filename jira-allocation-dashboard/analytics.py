@@ -13,6 +13,20 @@ MAPPING_COLUMNS = ["mapping_level", "jira_key", "summary", "allocation_category"
 MAPPING_LEVELS = ["Ticket", "Epic"]
 VALID_ALLOCATION_CATEGORIES = [*config.ALLOCATION_CATEGORIES, "Unmapped"]
 TARGET_COLUMNS = ["allocation_category", "target_percentage"]
+SPRINT_HISTORY_COLUMNS = [
+    "sprint",
+    "sprint_start_date",
+    "category",
+    "target_percent",
+    "target_story_points",
+    "actual_story_points",
+    "actual_percent_of_capacity",
+    "variance_percent",
+    "variance_story_points",
+    "total_sprint_story_points",
+    "capacity_used_percent",
+    "generated_at",
+]
 
 
 def load_allocation_mapping(path: Path = config.ALLOCATION_MAPPING_PATH) -> pd.DataFrame:
@@ -48,6 +62,95 @@ def load_sprint_targets(path: Path = config.SPRINT_TARGETS_PATH) -> pd.DataFrame
 
     targets["target_percentage"] = pd.to_numeric(targets["target_percentage"], errors="coerce").fillna(0)
     return targets[TARGET_COLUMNS]
+
+
+def load_sprint_history(path: Path = config.SPRINT_HISTORY_PATH) -> pd.DataFrame:
+    if path.exists():
+        history = pd.read_csv(path)
+    else:
+        history = pd.DataFrame(columns=SPRINT_HISTORY_COLUMNS)
+
+    for column in SPRINT_HISTORY_COLUMNS:
+        if column not in history.columns:
+            history[column] = ""
+
+    numeric_columns = [
+        "target_percent",
+        "target_story_points",
+        "actual_story_points",
+        "actual_percent_of_capacity",
+        "variance_percent",
+        "variance_story_points",
+        "total_sprint_story_points",
+        "capacity_used_percent",
+    ]
+    for column in numeric_columns:
+        history[column] = pd.to_numeric(history[column], errors="coerce")
+
+    return history[SPRINT_HISTORY_COLUMNS]
+
+
+def append_sprint_summary_to_history(
+    sprint: str,
+    summary_df: pd.DataFrame,
+    capacity_metrics: dict[str, float],
+    path: Path = config.SPRINT_HISTORY_PATH,
+) -> pd.DataFrame:
+    """Append allocation summary rows for one sprint to sprint history."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    history = load_sprint_history(path)
+    normalized_summary = _normalize_summary_for_history(summary_df)
+    generated_at = pd.Timestamp.utcnow().isoformat()
+    sprint_start_date = pd.Timestamp.utcnow().date().isoformat()
+
+    rows = normalized_summary[normalized_summary["category"].isin(config.ALLOCATION_CATEGORIES)].copy()
+    rows["sprint"] = sprint
+    rows["sprint_start_date"] = sprint_start_date
+    rows["total_sprint_story_points"] = capacity_metrics.get("total_story_points", 0)
+    rows["capacity_used_percent"] = capacity_metrics.get("total_capacity_percent", 0)
+    rows["generated_at"] = generated_at
+    rows = rows[SPRINT_HISTORY_COLUMNS]
+
+    updated_history = pd.concat([history, rows], ignore_index=True)
+    updated_history.to_csv(path, index=False)
+    return updated_history
+
+
+def calculate_average_actual_by_category(history_df: pd.DataFrame) -> pd.DataFrame:
+    history = _clean_history_for_analysis(history_df)
+    if history.empty:
+        return pd.DataFrame(
+            columns=[
+                "category",
+                "target_percent",
+                "average_actual_percent",
+                "average_variance_percent",
+                "number_of_sprints",
+                "number_of_sprints_over_target",
+            ]
+        )
+
+    return (
+        history.groupby("category", dropna=False)
+        .agg(
+            target_percent=("target_percent", "mean"),
+            average_actual_percent=("actual_percent_of_capacity", "mean"),
+            average_variance_percent=("variance_percent", "mean"),
+            number_of_sprints=("sprint", "nunique"),
+            number_of_sprints_over_target=("variance_percent", lambda values: int((values > 0).sum())),
+        )
+        .reset_index()
+    )
+
+
+def calculate_target_realism(history_df: pd.DataFrame) -> pd.DataFrame:
+    averages = calculate_average_actual_by_category(history_df)
+    if averages.empty:
+        averages["recommendation"] = []
+        return averages
+
+    averages["recommendation"] = averages.apply(_target_realism_recommendation, axis=1)
+    return averages
 
 
 def apply_allocation_mapping(issues: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
@@ -307,6 +410,70 @@ def _normalize_mapping_level(value: object) -> str:
 def _normalize_allocation_category(value: object) -> str:
     text = str(value).strip()
     return text if text in VALID_ALLOCATION_CATEGORIES else "Unmapped"
+
+
+def _normalize_summary_for_history(summary: pd.DataFrame) -> pd.DataFrame:
+    normalized = summary.copy()
+    rename_map = {
+        "allocation_category": "category",
+        "target_percentage": "target_percent",
+        "target_points": "target_story_points",
+        "actual_points": "actual_story_points",
+        "actual_percentage": "actual_percent_of_capacity",
+        "variance_percentage": "variance_percent",
+        "variance_points": "variance_story_points",
+    }
+    normalized = normalized.rename(columns=rename_map)
+    for column in [
+        "category",
+        "target_percent",
+        "target_story_points",
+        "actual_story_points",
+        "actual_percent_of_capacity",
+        "variance_percent",
+        "variance_story_points",
+    ]:
+        if column not in normalized.columns:
+            normalized[column] = 0 if column != "category" else ""
+
+    return normalized[
+        [
+            "category",
+            "target_percent",
+            "target_story_points",
+            "actual_story_points",
+            "actual_percent_of_capacity",
+            "variance_percent",
+            "variance_story_points",
+        ]
+    ]
+
+
+def _clean_history_for_analysis(history_df: pd.DataFrame) -> pd.DataFrame:
+    history = history_df.copy()
+    for column in SPRINT_HISTORY_COLUMNS:
+        if column not in history.columns:
+            history[column] = ""
+    history = history[history["category"].isin(config.ALLOCATION_CATEGORIES)].copy()
+    numeric_columns = [
+        "target_percent",
+        "actual_percent_of_capacity",
+        "variance_percent",
+    ]
+    for column in numeric_columns:
+        history[column] = pd.to_numeric(history[column], errors="coerce")
+    history = history.dropna(subset=["category", "target_percent", "actual_percent_of_capacity", "variance_percent"])
+    return history.sort_values("generated_at").drop_duplicates(["sprint", "category"], keep="last")
+
+
+def _target_realism_recommendation(row: pd.Series) -> str:
+    average_delta = row["average_actual_percent"] - row["target_percent"]
+    sprint_count = row["number_of_sprints"]
+    if sprint_count >= 4 and average_delta > 10:
+        return "Consider revisiting target allocation or reducing incoming demand."
+    if sprint_count >= 4 and average_delta < -10:
+        return "Target may be overallocated relative to actual demand."
+    return "Target appears directionally aligned."
 
 
 def _health_status(row: pd.Series) -> str:

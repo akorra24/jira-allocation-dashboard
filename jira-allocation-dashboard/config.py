@@ -47,6 +47,7 @@ EPIC_FIELD = os.getenv("EPIC_FIELD", "").strip()
 
 ALLOCATION_MAPPING_PATH = DATA_DIR / "allocation_mapping.csv"
 SPRINT_TARGETS_PATH = DATA_DIR / "sprint_targets.csv"
+SPRINT_HISTORY_PATH = DATA_DIR / "sprint_history.csv"
 
 
 def has_jira_credentials() -> bool:

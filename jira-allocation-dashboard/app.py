@@ -64,12 +64,13 @@ def main() -> None:
     summary = analytics.summarize_allocations(mapped_issues, targets)
 
     if page == "Dashboard":
-        render_dashboard_page(mapped_issues, summary, dashboard_filters)
+        render_dashboard_page(sprint_name, mapped_issues, summary, dashboard_filters)
     elif page == "Settings / Export":
         render_settings_export_page(mapped_issues, summary)
 
 
 def render_dashboard_page(
+    sprint_name: str,
     issues: pd.DataFrame,
     summary: pd.DataFrame,
     dashboard_filters: dict[str, object],
@@ -86,6 +87,9 @@ def render_dashboard_page(
     render_dashboard_section("Allocation - Category Level")
     render_allocation_category_level(filtered_summary, selected_metric)
     render_dashboard_charts(filtered_summary)
+
+    render_dashboard_section("Trend Analysis")
+    render_trend_analysis(sprint_name, issues, summary, all_capacity_usage)
 
     render_dashboard_section("Ticket Detail")
     render_ticket_detail_table(filtered_issues)
@@ -570,6 +574,116 @@ def render_dashboard_charts(summary: pd.DataFrame) -> None:
         st.plotly_chart(fig, use_container_width=True)
 
 
+def render_trend_analysis(
+    sprint_name: str,
+    issues: pd.DataFrame,
+    summary: pd.DataFrame,
+    capacity_usage: dict[str, float],
+) -> None:
+    del issues
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("Save current sprint to history", use_container_width=True):
+            analytics.append_sprint_summary_to_history(sprint_name, summary, capacity_usage)
+            st.success(f"Saved {sprint_name} to sprint history.")
+
+    history = analytics.load_sprint_history()
+    if history.empty:
+        st.info("No sprint history yet. Save the current sprint to history to start trend tracking.")
+        return
+
+    sprint_options = list(dict.fromkeys(history["sprint"].dropna().astype(str).tolist()))
+    default_sprints = sprint_options[-6:] if len(sprint_options) > 6 else sprint_options
+    selected_sprints = st.multiselect(
+        "Selected sprints for trend analysis",
+        options=sprint_options,
+        default=default_sprints,
+        key="trend_selected_sprints",
+    )
+    if not selected_sprints:
+        st.info("Select at least one sprint to show trend analysis.")
+        return
+
+    selected_history = history[history["sprint"].isin(selected_sprints)].copy()
+    selected_history = selected_history[selected_history["category"].isin(config.ALLOCATION_CATEGORIES)]
+    if selected_history.empty:
+        st.info("Selected sprints do not contain allocation history rows.")
+        return
+
+    render_trend_line_chart(selected_history)
+    render_target_realism_table(selected_history)
+
+
+def render_trend_line_chart(history: pd.DataFrame) -> None:
+    actual = history.rename(columns={"actual_percent_of_capacity": "percent"}).copy()
+    actual["metric"] = "Actual %"
+    target = history.rename(columns={"target_percent": "percent"}).copy()
+    target["metric"] = "Target %"
+    trend_data = pd.concat(
+        [
+            actual[["sprint", "sprint_start_date", "category", "percent", "metric"]],
+            target[["sprint", "sprint_start_date", "category", "percent", "metric"]],
+        ],
+        ignore_index=True,
+    )
+    trend_data["sprint_order"] = pd.to_datetime(trend_data["sprint_start_date"], errors="coerce")
+    trend_data = trend_data.sort_values(["sprint_order", "sprint", "category", "metric"])
+
+    fig = px.line(
+        trend_data,
+        x="sprint",
+        y="percent",
+        color="category",
+        line_dash="metric",
+        markers=True,
+        title="Actual allocation % over time with target lines",
+        template=PLOTLY_TEMPLATE,
+    )
+    fig.update_layout(yaxis_title="Percent of capacity", xaxis_title="Sprint")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_target_realism_table(history: pd.DataFrame) -> None:
+    realism = analytics.calculate_target_realism(history)
+    if realism.empty:
+        st.info("No target realism metrics available for the selected sprints.")
+        return
+
+    table = realism.rename(
+        columns={
+            "category": "Category",
+            "target_percent": "Target %",
+            "average_actual_percent": "Average Actual %",
+            "average_variance_percent": "Average Variance %",
+            "number_of_sprints_over_target": "Number of Sprints Over Target",
+            "recommendation": "Recommendation",
+        }
+    )
+    table = table[
+        [
+            "Category",
+            "Target %",
+            "Average Actual %",
+            "Average Variance %",
+            "Number of Sprints Over Target",
+            "Recommendation",
+        ]
+    ]
+    st.caption("Average actual % across selected sprints and target realism recommendations.")
+    styled = (
+        table.style.format(
+            {
+                "Target %": format_unsigned_percent,
+                "Average Actual %": format_unsigned_percent,
+                "Average Variance %": format_signed_percent,
+                "Number of Sprints Over Target": "{:.0f}",
+            }
+        )
+        .applymap(variance_cell_style, subset=["Average Variance %"])
+    )
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
 def render_ticket_detail_table(issues: pd.DataFrame) -> None:
     detail = analytics.ensure_issue_schema(issues).copy()
     detail["epic"] = detail.apply(
@@ -612,7 +726,7 @@ def variance_bucket(value: object) -> str:
         return "watch"
     if variance > 15:
         return "over"
-        return "under"
+    return "under"
 
 
 def status_background(status: str) -> str:
