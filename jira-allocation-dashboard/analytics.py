@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
+import re
 
+from openpyxl.styles import Alignment, Font, PatternFill
 import pandas as pd
 
 import config
@@ -177,6 +180,69 @@ def apply_allocation_mapping(issues: pd.DataFrame, mapping: pd.DataFrame) -> pd.
     return issues
 
 
+def ticket_mapping_editor_rows(issues: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
+    """Build the ticket mapping editor view with existing ticket/epic notes applied."""
+    issues = ensure_issue_schema(issues)
+    note_map = mapping_notes_by_key(mapping)
+    rows = issues[
+        [
+            "ticket_key",
+            "summary",
+            "issue_type",
+            "story_points",
+            "epic_key",
+            "epic_name",
+            "status",
+            "allocation_category",
+        ]
+    ].copy()
+    rows["notes"] = rows["ticket_key"].map(note_map["Ticket"]).fillna(rows["epic_key"].map(note_map["Epic"]))
+    rows["notes"] = rows["notes"].fillna("")
+    return rows
+
+
+def mapping_notes_by_key(mapping: pd.DataFrame) -> dict[str, dict[str, str]]:
+    mapping = load_allocation_mapping() if mapping.empty else _clean_mapping(mapping)
+    ticket_notes = mapping[mapping["mapping_level"] == "Ticket"]
+    epic_notes = mapping[mapping["mapping_level"] == "Epic"]
+    return {
+        "Ticket": dict(zip(ticket_notes["jira_key"], ticket_notes["notes"], strict=False)),
+        "Epic": dict(zip(epic_notes["jira_key"], epic_notes["notes"], strict=False)),
+    }
+
+
+def mapping_from_ticket_editor(edited_rows: pd.DataFrame) -> pd.DataFrame:
+    rows = edited_rows.copy()
+    rows["allocation_category"] = rows["allocation_category"].fillna("Unmapped")
+    rows.loc[
+        ~rows["allocation_category"].isin(VALID_ALLOCATION_CATEGORIES),
+        "allocation_category",
+    ] = "Unmapped"
+    return pd.DataFrame(
+        {
+            "mapping_level": "Ticket",
+            "jira_key": rows["ticket_key"],
+            "summary": rows["summary"],
+            "allocation_category": rows["allocation_category"],
+            "notes": rows["notes"].fillna(""),
+            "last_updated": date.today().isoformat(),
+        }
+    )
+
+
+def merge_ticket_mappings(existing_mapping: pd.DataFrame, ticket_mapping: pd.DataFrame) -> pd.DataFrame:
+    existing_mapping = _clean_mapping(existing_mapping)
+    ticket_mapping = _clean_mapping(ticket_mapping)
+    ticket_keys = set(ticket_mapping["jira_key"].astype(str))
+    retained = existing_mapping[
+        ~(
+            (existing_mapping["mapping_level"] == "Ticket")
+            & (existing_mapping["jira_key"].astype(str).isin(ticket_keys))
+        )
+    ]
+    return pd.concat([retained, ticket_mapping], ignore_index=True)
+
+
 def calculate_allocation_summary(issues_df: pd.DataFrame) -> pd.DataFrame:
     """Calculate target, actual, and variance metrics by allocation category."""
     issues = ensure_issue_schema(issues_df)
@@ -205,10 +271,16 @@ def calculate_allocation_summary(issues_df: pd.DataFrame) -> pd.DataFrame:
     summary = target_rows.merge(grouped, how="left", on="allocation_category")
     summary["actual_story_points"] = summary["actual_story_points"].fillna(0)
     summary["ticket_count"] = summary["ticket_count"].fillna(0).astype(int)
+
+    # Formula: target story points = target percent / 100 * fixed sprint capacity (55).
     summary["target_story_points"] = summary["target_percent"] / 100 * config.SPRINT_CAPACITY_POINTS
+
+    # Formula: actual allocation percent = category story points / fixed sprint capacity (55) * 100.
     summary["actual_percent_of_capacity"] = (
         summary["actual_story_points"] / config.SPRINT_CAPACITY_POINTS * 100
     )
+
+    # Variance compares actual allocation against the category target in both percentage points and story points.
     summary["variance_percent"] = summary["actual_percent_of_capacity"] - summary["target_percent"]
     summary["variance_story_points"] = summary["actual_story_points"] - summary["target_story_points"]
 
@@ -257,6 +329,8 @@ def calculate_total_capacity_usage(issues_df: pd.DataFrame) -> dict[str, float]:
     issues = ensure_issue_schema(issues_df)
     total_story_points = pd.to_numeric(issues["story_points"], errors="coerce").fillna(0).sum()
     sprint_capacity_points = config.SPRINT_CAPACITY_POINTS
+
+    # Formula: total capacity percent = total pointed sprint work / 55 * 100.
     total_capacity_percent = total_story_points / sprint_capacity_points * 100
     over_under_capacity_story_points = total_story_points - sprint_capacity_points
     over_under_capacity_percent = total_capacity_percent - 100
@@ -322,6 +396,146 @@ def issue_editor_rows(issues: pd.DataFrame) -> pd.DataFrame:
         "notes",
     ]
     return ensure_issue_schema(issues)[columns]
+
+
+def export_sprint_artifacts(
+    sprint_name: str,
+    summary: pd.DataFrame,
+    issues: pd.DataFrame,
+    output_dir: Path = config.OUTPUTS_DIR,
+) -> dict[str, Path]:
+    """Write sanitized CSV and Excel export files for the current sprint."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    slug = slugify_filename(sprint_name or "current-sprint")
+    base_name = f"{slug}_{timestamp}"
+
+    ticket_detail = prepare_ticket_detail_export(issues)
+    allocation_summary = prepare_allocation_summary_export(summary)
+    sprint_history = load_sprint_history()
+
+    ticket_detail_path = output_dir / f"{base_name}_ticket_detail.csv"
+    allocation_summary_path = output_dir / f"{base_name}_allocation_summary.csv"
+    sprint_history_path = output_dir / f"{base_name}_sprint_history.csv"
+    excel_path = output_dir / f"{base_name}_current_sprint_summary.xlsx"
+
+    ticket_detail.to_csv(ticket_detail_path, index=False)
+    allocation_summary.to_csv(allocation_summary_path, index=False)
+    sprint_history.to_csv(sprint_history_path, index=False)
+    write_formatted_excel_export(excel_path, allocation_summary, ticket_detail)
+
+    return {
+        "ticket_detail_csv": ticket_detail_path,
+        "allocation_summary_csv": allocation_summary_path,
+        "sprint_history_csv": sprint_history_path,
+        "current_sprint_excel": excel_path,
+    }
+
+
+def prepare_ticket_detail_export(issues: pd.DataFrame) -> pd.DataFrame:
+    """Return ticket detail export columns only; credentials/config values are excluded."""
+    issues = ensure_issue_schema(issues)
+    columns = [
+        "ticket_key",
+        "summary",
+        "issue_type",
+        "story_points",
+        "epic_key",
+        "epic_name",
+        "status",
+        "assignee",
+        "allocation_category",
+        "notes",
+    ]
+    return issues[columns].copy()
+
+
+def prepare_allocation_summary_export(summary: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "allocation_category",
+        "target_percentage",
+        "target_points",
+        "actual_points",
+        "actual_percentage",
+        "variance_percentage",
+        "variance_points",
+        "ticket_count",
+        "status",
+    ]
+    available_columns = [column for column in columns if column in summary.columns]
+    return summary[available_columns].copy()
+
+
+def write_formatted_excel_export(
+    path: Path,
+    allocation_summary: pd.DataFrame,
+    ticket_detail: pd.DataFrame,
+) -> None:
+    excel_summary = prepare_excel_dataframe(allocation_summary)
+    excel_ticket_detail = prepare_excel_dataframe(ticket_detail)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        excel_summary.to_excel(writer, index=False, sheet_name="Allocation Summary")
+        excel_ticket_detail.to_excel(writer, index=False, sheet_name="Ticket Detail")
+        format_excel_worksheet(writer.book["Allocation Summary"], allocation_summary.columns)
+        format_excel_worksheet(writer.book["Ticket Detail"], ticket_detail.columns)
+
+
+def prepare_excel_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    excel_df = df.copy()
+    for column in percent_columns(excel_df.columns):
+        excel_df[column] = pd.to_numeric(excel_df[column], errors="coerce") / 100
+    return excel_df
+
+
+def format_excel_worksheet(worksheet, columns: pd.Index) -> None:
+    header_fill = PatternFill(fill_type="solid", fgColor="F1F3F4")
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    worksheet.freeze_panes = "A2"
+
+    percent_column_names = set(percent_columns(columns))
+    point_column_names = set(point_columns(columns))
+    for column_index, column_name in enumerate(columns, start=1):
+        column_letter = worksheet.cell(row=1, column=column_index).column_letter
+        max_length = len(str(column_name))
+        for cell in worksheet[column_letter]:
+            if cell.row > 1:
+                if column_name in percent_column_names:
+                    cell.number_format = "0%"
+                elif column_name in point_column_names:
+                    cell.number_format = "0.0"
+            max_length = max(max_length, len(str(cell.value)) if cell.value is not None else 0)
+        worksheet.column_dimensions[column_letter].width = min(max_length + 2, 60)
+
+
+def percent_columns(columns) -> list[str]:
+    return [column for column in columns if "percent" in str(column).lower() or "percentage" in str(column).lower()]
+
+
+def point_columns(columns) -> list[str]:
+    return [column for column in columns if "point" in str(column).lower() or str(column).lower().endswith("_sp")]
+
+
+def slugify_filename(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-").lower()
+    return slug or "current-sprint"
+
+
+def export_label(label: str) -> str:
+    return {
+        "ticket_detail_csv": "ticket detail CSV",
+        "allocation_summary_csv": "allocation summary CSV",
+        "sprint_history_csv": "sprint history CSV",
+        "current_sprint_excel": "current sprint Excel summary",
+    }.get(label, label)
+
+
+def export_mime_type(path: Path) -> str:
+    if path.suffix == ".xlsx":
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return "text/csv"
 
 
 def classify_variance(variance_percentage: float) -> str:

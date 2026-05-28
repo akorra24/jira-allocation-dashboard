@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date
-import re
 from pathlib import Path
 
-from openpyxl.styles import Alignment, Font, PatternFill
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 import analytics
@@ -110,7 +106,7 @@ def render_ticket_mapping_page(default_sprint_name: str) -> None:
     raw_issues = load_issues(sprint_name, st.session_state.get("use_sample_cheeseburger_data", False))
     mapping = analytics.load_allocation_mapping()
     mapped_issues = analytics.apply_allocation_mapping(raw_issues, mapping)
-    editor_rows = ticket_mapping_editor_rows(mapped_issues, mapping)
+    editor_rows = analytics.ticket_mapping_editor_rows(mapped_issues, mapping)
 
     unmapped_count = int((editor_rows["allocation_category"] == "Unmapped").sum())
     col1, col2, col3 = st.columns(3)
@@ -145,10 +141,16 @@ def render_ticket_mapping_page(default_sprint_name: str) -> None:
     summary = analytics.summarize_allocations(preview_issues, analytics.load_sprint_targets())
 
     if st.button("Save Allocation Mapping", type="primary"):
-        updated_mapping = merge_ticket_mappings(mapping, mapping_from_ticket_editor(edited_rows))
-        analytics.save_allocation_mapping(updated_mapping)
-        st.success("Allocation mapping saved to data/allocation_mapping.csv.")
-        st.cache_data.clear()
+        try:
+            updated_mapping = analytics.merge_ticket_mappings(
+                mapping,
+                analytics.mapping_from_ticket_editor(edited_rows),
+            )
+            analytics.save_allocation_mapping(updated_mapping)
+            st.success("Allocation mapping saved to data/allocation_mapping.csv.")
+            st.cache_data.clear()
+        except OSError as exc:
+            st.error(f"Could not save allocation mapping. Check file permissions for data/allocation_mapping.csv. {exc}")
 
     render_scorecards(preview_issues, summary)
     render_tables(summary, preview_issues)
@@ -329,7 +331,13 @@ def load_issues(sprint_name: str, use_sample_data: bool = False) -> pd.DataFrame
 
     client = JiraClient()
     try:
-        return pd.DataFrame(client.get_issues_for_sprint(sprint_name))
+        issues = pd.DataFrame(client.get_issues_for_sprint(sprint_name))
+        if issues.empty:
+            st.warning(
+                "Jira returned no tickets for this sprint. Check the sprint name/ID, project key, and Jira permissions. "
+                "You can enable the sample data checkbox to test the dashboard UI."
+            )
+        return issues
     except JiraClientError as exc:
         st.warning(f"Jira request failed, using sample data instead: {exc}")
         return sample_issues("S215")
@@ -595,8 +603,11 @@ def render_trend_analysis(
     col1, col2 = st.columns([1, 3])
     with col1:
         if st.button("Save current sprint to history", use_container_width=True):
-            analytics.append_sprint_summary_to_history(sprint_name, summary, capacity_usage)
-            st.success(f"Saved {sprint_name} to sprint history.")
+            try:
+                analytics.append_sprint_summary_to_history(sprint_name, summary, capacity_usage)
+                st.success(f"Saved {sprint_name} to sprint history.")
+            except OSError as exc:
+                st.error(f"Could not save sprint history. Check file permissions for data/sprint_history.csv. {exc}")
 
     history = analytics.load_sprint_history()
     if history.empty:
@@ -771,66 +782,6 @@ def category_cell_style(value: object) -> str:
     return ""
 
 
-def ticket_mapping_editor_rows(issues: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
-    issues = analytics.ensure_issue_schema(issues)
-    note_map = mapping_notes_by_key(mapping)
-    rows = issues[
-        [
-            "ticket_key",
-            "summary",
-            "issue_type",
-            "story_points",
-            "epic_key",
-            "epic_name",
-            "status",
-            "allocation_category",
-        ]
-    ].copy()
-    rows["notes"] = rows["ticket_key"].map(note_map["Ticket"]).fillna(rows["epic_key"].map(note_map["Epic"]))
-    rows["notes"] = rows["notes"].fillna("")
-    return rows
-
-
-def mapping_notes_by_key(mapping: pd.DataFrame) -> dict[str, dict[str, str]]:
-    mapping = analytics.load_allocation_mapping() if mapping.empty else mapping
-    ticket_notes = mapping[mapping["mapping_level"] == "Ticket"]
-    epic_notes = mapping[mapping["mapping_level"] == "Epic"]
-    return {
-        "Ticket": dict(zip(ticket_notes["jira_key"], ticket_notes["notes"], strict=False)),
-        "Epic": dict(zip(epic_notes["jira_key"], epic_notes["notes"], strict=False)),
-    }
-
-
-def mapping_from_ticket_editor(edited_rows: pd.DataFrame) -> pd.DataFrame:
-    rows = edited_rows.copy()
-    rows["allocation_category"] = rows["allocation_category"].fillna("Unmapped")
-    rows.loc[
-        ~rows["allocation_category"].isin(analytics.VALID_ALLOCATION_CATEGORIES),
-        "allocation_category",
-    ] = "Unmapped"
-    return pd.DataFrame(
-        {
-            "mapping_level": "Ticket",
-            "jira_key": rows["ticket_key"],
-            "summary": rows["summary"],
-            "allocation_category": rows["allocation_category"],
-            "notes": rows["notes"].fillna(""),
-            "last_updated": date.today().isoformat(),
-        }
-    )
-
-
-def merge_ticket_mappings(existing_mapping: pd.DataFrame, ticket_mapping: pd.DataFrame) -> pd.DataFrame:
-    ticket_keys = set(ticket_mapping["jira_key"].astype(str))
-    retained = existing_mapping[
-        ~(
-            (existing_mapping["mapping_level"] == "Ticket")
-            & (existing_mapping["jira_key"].astype(str).isin(ticket_keys))
-        )
-    ]
-    return pd.concat([retained, ticket_mapping], ignore_index=True)
-
-
 def render_scorecards(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
     assigned_issues = issues[issues["mapped_allocation_category"].isin(config.ALLOCATION_CATEGORIES)]
     assigned_points = assigned_issues["story_points"].sum()
@@ -848,94 +799,6 @@ def render_scorecards(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
         largest_variance["allocation_category"],
         f"{largest_variance['variance_percentage']:+.1f} pp",
     )
-
-
-def render_charts(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
-    st.subheader("Allocation performance")
-
-    bar_data = summary.melt(
-        id_vars="allocation_category",
-        value_vars=["actual_percentage", "target_percentage"],
-        var_name="metric",
-        value_name="percentage",
-    )
-    bar_data["metric"] = bar_data["metric"].map(
-        {
-            "actual_percentage": "Actual allocation",
-            "target_percentage": "Target allocation",
-        }
-    )
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        fig = px.bar(
-            bar_data,
-            x="allocation_category",
-            y="percentage",
-            color="metric",
-            barmode="group",
-            text_auto=".1f",
-            title="Actual vs target allocation percentage",
-            template=PLOTLY_TEMPLATE,
-        )
-        fig.update_layout(yaxis_title="% of 55-point capacity", xaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        donut_data = summary[summary["actual_points"] > 0]
-        fig = px.pie(
-            donut_data,
-            values="actual_points",
-            names="allocation_category",
-            hole=0.55,
-            title="Actual point mix",
-            template=PLOTLY_TEMPLATE,
-        )
-        fig.update_traces(textposition="inside", textinfo="percent+label")
-        st.plotly_chart(fig, use_container_width=True)
-
-    heatmap_summary = summary[summary["variance_percentage"].notna()]
-    heatmap_values = heatmap_summary[["variance_percentage"]].T
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=heatmap_values.values,
-            x=heatmap_summary["allocation_category"],
-            y=["Variance"],
-            colorscale=[
-                [0.0, LOOKER_COLORS["red"]],
-                [0.5, "#ffffff"],
-                [1.0, LOOKER_COLORS["green"]],
-            ],
-            zmid=0,
-            text=heatmap_values.round(1).astype(str).values,
-            texttemplate="%{text}%",
-            hovertemplate="%{x}<br>Variance: %{z:.1f}%<extra></extra>",
-        )
-    )
-    fig.update_layout(
-        title="Variance heatmap: actual % minus target %",
-        template=PLOTLY_TEMPLATE,
-        height=260,
-        yaxis_title="",
-        xaxis_title="",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    issue_mix = (
-        issues.groupby(["mapped_allocation_category", "status"], dropna=False)["story_points"]
-        .sum()
-        .reset_index()
-    )
-    fig = px.bar(
-        issue_mix,
-        x="mapped_allocation_category",
-        y="story_points",
-        color="status",
-        title="Story points by allocation and status",
-        template=PLOTLY_TEMPLATE,
-    )
-    fig.update_layout(xaxis_title="", yaxis_title="Story points")
-    st.plotly_chart(fig, use_container_width=True)
 
 
 def render_tables(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
@@ -980,8 +843,12 @@ def render_export(sprint_name: str, summary: pd.DataFrame, issues: pd.DataFrame)
     st.caption("Exports include sprint allocation and ticket data only. Jira credentials and environment variables are excluded.")
 
     if st.button("Generate export files", type="primary"):
-        st.session_state["export_paths"] = export_sprint_artifacts(sprint_name, summary, issues)
-        st.success(f"Export files written to {config.OUTPUTS_DIR.relative_to(config.APP_DIR)}.")
+        try:
+            st.session_state["export_paths"] = analytics.export_sprint_artifacts(sprint_name, summary, issues)
+            st.success(f"Export files written to {config.OUTPUTS_DIR.relative_to(config.APP_DIR)}.")
+        except OSError as exc:
+            st.error(f"Could not write export files. Check permissions for the outputs folder. {exc}")
+            return
 
     export_paths = st.session_state.get("export_paths")
     if not export_paths:
@@ -993,150 +860,12 @@ def render_export(sprint_name: str, summary: pd.DataFrame, issues: pd.DataFrame)
         if not path.exists():
             continue
         st.download_button(
-            label=f"Download {export_label(label)}",
+            label=f"Download {analytics.export_label(label)}",
             data=path.read_bytes(),
             file_name=path.name,
-            mime=export_mime_type(path),
+            mime=analytics.export_mime_type(path),
             key=f"download_{label}",
         )
-
-
-def export_sprint_artifacts(
-    sprint_name: str,
-    summary: pd.DataFrame,
-    issues: pd.DataFrame,
-    output_dir: Path = config.OUTPUTS_DIR,
-) -> dict[str, Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    slug = slugify_filename(sprint_name or "current-sprint")
-    base_name = f"{slug}_{timestamp}"
-
-    ticket_detail = prepare_ticket_detail_export(issues)
-    allocation_summary = prepare_allocation_summary_export(summary)
-    sprint_history = analytics.load_sprint_history()
-
-    ticket_detail_path = output_dir / f"{base_name}_ticket_detail.csv"
-    allocation_summary_path = output_dir / f"{base_name}_allocation_summary.csv"
-    sprint_history_path = output_dir / f"{base_name}_sprint_history.csv"
-    excel_path = output_dir / f"{base_name}_current_sprint_summary.xlsx"
-
-    ticket_detail.to_csv(ticket_detail_path, index=False)
-    allocation_summary.to_csv(allocation_summary_path, index=False)
-    sprint_history.to_csv(sprint_history_path, index=False)
-    write_formatted_excel_export(excel_path, allocation_summary, ticket_detail)
-
-    return {
-        "ticket_detail_csv": ticket_detail_path,
-        "allocation_summary_csv": allocation_summary_path,
-        "sprint_history_csv": sprint_history_path,
-        "current_sprint_excel": excel_path,
-    }
-
-
-def prepare_ticket_detail_export(issues: pd.DataFrame) -> pd.DataFrame:
-    issues = analytics.ensure_issue_schema(issues)
-    columns = [
-        "ticket_key",
-        "summary",
-        "issue_type",
-        "story_points",
-        "epic_key",
-        "epic_name",
-        "status",
-        "assignee",
-        "allocation_category",
-        "notes",
-    ]
-    return issues[columns].copy()
-
-
-def prepare_allocation_summary_export(summary: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "allocation_category",
-        "target_percentage",
-        "target_points",
-        "actual_points",
-        "actual_percentage",
-        "variance_percentage",
-        "variance_points",
-        "ticket_count",
-        "status",
-    ]
-    available_columns = [column for column in columns if column in summary.columns]
-    return summary[available_columns].copy()
-
-
-def write_formatted_excel_export(
-    path: Path,
-    allocation_summary: pd.DataFrame,
-    ticket_detail: pd.DataFrame,
-) -> None:
-    excel_summary = prepare_excel_dataframe(allocation_summary)
-    excel_ticket_detail = prepare_excel_dataframe(ticket_detail)
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        excel_summary.to_excel(writer, index=False, sheet_name="Allocation Summary")
-        excel_ticket_detail.to_excel(writer, index=False, sheet_name="Ticket Detail")
-        format_excel_worksheet(writer.book["Allocation Summary"], allocation_summary.columns)
-        format_excel_worksheet(writer.book["Ticket Detail"], ticket_detail.columns)
-
-
-def prepare_excel_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    excel_df = df.copy()
-    for column in percent_columns(excel_df.columns):
-        excel_df[column] = pd.to_numeric(excel_df[column], errors="coerce") / 100
-    return excel_df
-
-
-def format_excel_worksheet(worksheet, columns: pd.Index) -> None:
-    header_fill = PatternFill(fill_type="solid", fgColor="F1F3F4")
-    for cell in worksheet[1]:
-        cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-    worksheet.freeze_panes = "A2"
-
-    percent_column_names = set(percent_columns(columns))
-    point_column_names = set(point_columns(columns))
-    for column_index, column_name in enumerate(columns, start=1):
-        column_letter = worksheet.cell(row=1, column=column_index).column_letter
-        max_length = len(str(column_name))
-        for cell in worksheet[column_letter]:
-            if cell.row > 1:
-                if column_name in percent_column_names:
-                    cell.number_format = "0%"
-                elif column_name in point_column_names:
-                    cell.number_format = "0.0"
-            max_length = max(max_length, len(str(cell.value)) if cell.value is not None else 0)
-        worksheet.column_dimensions[column_letter].width = min(max_length + 2, 60)
-
-
-def percent_columns(columns) -> list[str]:
-    return [column for column in columns if "percent" in str(column).lower() or "percentage" in str(column).lower()]
-
-
-def point_columns(columns) -> list[str]:
-    return [column for column in columns if "point" in str(column).lower() or str(column).lower().endswith("_sp")]
-
-
-def slugify_filename(value: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-").lower()
-    return slug or "current-sprint"
-
-
-def export_label(label: str) -> str:
-    return {
-        "ticket_detail_csv": "ticket detail CSV",
-        "allocation_summary_csv": "allocation summary CSV",
-        "sprint_history_csv": "sprint history CSV",
-        "current_sprint_excel": "current sprint Excel summary",
-    }.get(label, label)
-
-
-def export_mime_type(path: Path) -> str:
-    if path.suffix == ".xlsx":
-        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    return "text/csv"
 
 
 def format_unsigned_percent(value: object) -> str:
