@@ -23,6 +23,8 @@ NAVIGATION_PAGES = [
     "Settings / Export",
 ]
 
+METRIC_VIEWS = ["Actual %", "Variance %", "Story Points"]
+
 
 st.set_page_config(
     page_title="ECOMM Cheeseburger Sprint Allocation",
@@ -35,7 +37,7 @@ apply_page_styles()
 def main() -> None:
     render_header()
 
-    page, sprint_name = render_sidebar()
+    page, sprint_name, dashboard_filters = render_sidebar()
     if page == "Jira Field Discovery":
         render_jira_field_discovery_page()
         return
@@ -53,15 +55,31 @@ def main() -> None:
     summary = analytics.summarize_allocations(mapped_issues, targets)
 
     if page == "Dashboard":
-        render_dashboard_page(mapped_issues, summary)
+        render_dashboard_page(mapped_issues, summary, dashboard_filters)
     elif page == "Settings / Export":
         render_settings_export_page(mapped_issues, summary)
 
 
-def render_dashboard_page(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
-    render_scorecards(issues, summary)
-    render_charts(summary, issues)
-    render_tables(summary, issues)
+def render_dashboard_page(
+    issues: pd.DataFrame,
+    summary: pd.DataFrame,
+    dashboard_filters: dict[str, object],
+) -> None:
+    filtered_issues, filtered_summary = apply_dashboard_filters(issues, summary, dashboard_filters)
+    capacity_usage = analytics.calculate_total_capacity_usage(filtered_issues)
+    all_capacity_usage = analytics.calculate_total_capacity_usage(issues)
+    selected_metric = str(dashboard_filters["metric_view"])
+
+    render_dashboard_kpis(issues, filtered_issues, filtered_summary, capacity_usage)
+    render_dashboard_section("Resourcing - Team Level")
+    render_resourcing_team_level(capacity_usage, all_capacity_usage)
+
+    render_dashboard_section("Allocation - Category Level")
+    render_allocation_category_level(filtered_summary, selected_metric)
+    render_dashboard_charts(filtered_summary)
+
+    render_dashboard_section("Ticket Detail")
+    render_ticket_detail_table(filtered_issues)
 
 
 def render_ticket_mapping_page(default_sprint_name: str) -> None:
@@ -162,8 +180,13 @@ def render_header() -> None:
     )
 
 
-def render_sidebar() -> tuple[str, str]:
+def render_sidebar() -> tuple[str, str, dict[str, object]]:
     settings = JiraSettings()
+    dashboard_filters: dict[str, object] = {
+        "categories": analytics.VALID_ALLOCATION_CATEGORIES,
+        "include_unmapped": True,
+        "metric_view": METRIC_VIEWS[0],
+    }
 
     with st.sidebar:
         st.header("Navigation")
@@ -177,6 +200,29 @@ def render_sidebar() -> tuple[str, str]:
             help="Used in the Jira JQL sprint filter when Jira credentials are configured.",
         )
 
+        if page == "Dashboard":
+            st.divider()
+            st.header("Dashboard filters")
+            include_unmapped = st.toggle("Include unmapped work", value=True)
+            category_options = list(config.ALLOCATION_CATEGORIES)
+            if include_unmapped:
+                category_options.append("Unmapped")
+            categories = st.multiselect(
+                "Allocation categories",
+                options=category_options,
+                default=category_options,
+            )
+            metric_view = st.radio(
+                "Metric view",
+                METRIC_VIEWS,
+                horizontal=False,
+            )
+            dashboard_filters = {
+                "categories": categories or category_options,
+                "include_unmapped": include_unmapped,
+                "metric_view": metric_view,
+            }
+
         st.divider()
         st.subheader("Jira connection")
         if settings.is_configured:
@@ -188,7 +234,7 @@ def render_sidebar() -> tuple[str, str]:
         st.caption("Set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env to enable live Jira data.")
         st.metric("Sprint capacity", f"{config.SPRINT_CAPACITY_POINTS} pts")
 
-    return page, sprint_name
+    return page, sprint_name, dashboard_filters
 
 
 def render_story_points_warning() -> None:
@@ -300,6 +346,312 @@ def load_env_example_text() -> str:
             "SPRINT_FIELD=your-sprint-field-id\n"
             "EPIC_FIELD=your-epic-field-id"
         )
+
+
+def apply_dashboard_filters(
+    issues: pd.DataFrame,
+    summary: pd.DataFrame,
+    dashboard_filters: dict[str, object],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    del summary
+    filtered_issues = analytics.ensure_issue_schema(issues)
+    selected_categories = set(dashboard_filters.get("categories", analytics.VALID_ALLOCATION_CATEGORIES))
+    include_unmapped = bool(dashboard_filters.get("include_unmapped", True))
+
+    if not include_unmapped:
+        filtered_issues = filtered_issues[filtered_issues["allocation_category"] != "Unmapped"]
+        selected_categories.discard("Unmapped")
+
+    filtered_issues = filtered_issues[filtered_issues["allocation_category"].isin(selected_categories)].copy()
+    filtered_summary = analytics.summarize_allocations(filtered_issues, analytics.load_sprint_targets())
+    filtered_summary = filtered_summary[filtered_summary["allocation_category"].isin(selected_categories)].copy()
+    if not include_unmapped:
+        filtered_summary = filtered_summary[filtered_summary["allocation_category"] != "Unmapped"]
+    return filtered_issues, filtered_summary
+
+
+def render_dashboard_section(title: str) -> None:
+    st.markdown(f'<div class="looker-section">{title}</div>', unsafe_allow_html=True)
+
+
+def render_dashboard_kpis(
+    all_issues: pd.DataFrame,
+    filtered_issues: pd.DataFrame,
+    summary: pd.DataFrame,
+    capacity_usage: dict[str, float],
+) -> None:
+    bpl_row = summary[summary["allocation_category"] == "Product/BPL"]
+    bpl_actual = 0 if bpl_row.empty else float(bpl_row["actual_percentage"].iloc[0])
+    bpl_variance = 0 if bpl_row.empty or pd.isna(bpl_row["variance_percentage"].iloc[0]) else float(
+        bpl_row["variance_percentage"].iloc[0]
+    )
+    unmapped_points = (
+        pd.to_numeric(all_issues.loc[all_issues["allocation_category"] == "Unmapped", "story_points"], errors="coerce")
+        .fillna(0)
+        .sum()
+    )
+
+    kpis = [
+        ("Sprint Capacity Goal", f"{config.SPRINT_CAPACITY_POINTS:.0f} pts", "Fixed denominator"),
+        ("Total Pointed Work", f"{capacity_usage['total_story_points']:.0f} pts", f"{len(filtered_issues)} tickets"),
+        (
+            "Capacity Used %",
+            f"{capacity_usage['total_capacity_percent']:.1f}%",
+            f"{capacity_usage['over_under_capacity_story_points']:+.0f} pts vs goal",
+        ),
+        ("BPL Actual %", f"{bpl_actual:.1f}%", "Target 45.0%"),
+        ("BPL Variance vs Target", f"{bpl_variance:+.1f} pp", "Actual minus target"),
+        ("Unmapped Story Points", f"{unmapped_points:.0f} pts", "Needs categorization"),
+    ]
+
+    columns = st.columns(6)
+    for column, (label, value, delta) in zip(columns, kpis, strict=False):
+        with column:
+            render_kpi_card(label, value, delta, kpi_color(label, value, bpl_variance, capacity_usage))
+
+
+def render_kpi_card(label: str, value: str, delta: str, color: str) -> None:
+    st.markdown(
+        f"""
+        <div class="kpi-card" style="border-top: 4px solid {color};">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value">{value}</div>
+            <div class="kpi-delta">{delta}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def kpi_color(label: str, value: str, bpl_variance: float, capacity_usage: dict[str, float]) -> str:
+    del value
+    if label == "Capacity Used %":
+        return capacity_color(capacity_usage["total_capacity_percent"])
+    if label == "BPL Variance vs Target":
+        return variance_color(bpl_variance)
+    if label == "Unmapped Story Points":
+        return LOOKER_COLORS["gray"]
+    return LOOKER_COLORS["blue"]
+
+
+def render_resourcing_team_level(
+    capacity_usage: dict[str, float],
+    all_capacity_usage: dict[str, float],
+) -> None:
+    del all_capacity_usage
+    capacity_percent = capacity_usage["total_capacity_percent"]
+    status = capacity_status(capacity_percent)
+    table = pd.DataFrame(
+        [
+            {
+                "Team": "ECOMM Cheeseburger",
+                "Pointed Work": f"{capacity_usage['total_story_points']:.0f} pts",
+                "Capacity Goal": f"{capacity_usage['sprint_capacity_points']:.0f} pts",
+                "Usage": (
+                    f"{capacity_usage['total_story_points']:.0f} / "
+                    f"{capacity_usage['sprint_capacity_points']:.0f} = {capacity_percent:.1f}%"
+                ),
+                "Over / Under": f"{capacity_usage['over_under_capacity_story_points']:+.0f} pts",
+                "Status": status,
+            }
+        ]
+    )
+    st.dataframe(
+        table.style.applymap(lambda _: f"background-color: {status_background(status)}", subset=["Status"]),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def render_allocation_category_level(summary: pd.DataFrame, selected_metric: str) -> None:
+    display = summary.copy()
+    display = display.rename(
+        columns={
+            "allocation_category": "Category",
+            "target_percentage": "Target %",
+            "target_points": "Target SP",
+            "actual_points": "Actual SP",
+            "actual_percentage": "Actual %",
+            "variance_percentage": "Variance %",
+            "variance_points": "Variance SP",
+            "status": "Status",
+        }
+    )
+    display = display[
+        ["Category", "Target %", "Target SP", "Actual SP", "Actual %", "Variance %", "Variance SP", "Status"]
+    ]
+
+    metric_column = {
+        "Actual %": "Actual %",
+        "Variance %": "Variance %",
+        "Story Points": "Actual SP",
+    }[selected_metric]
+    st.caption(f"Metric toggle: highlighting {selected_metric}.")
+
+    styled = (
+        display.style.format(
+            {
+                "Target %": format_percent,
+                "Target SP": format_number,
+                "Actual SP": format_number,
+                "Actual %": format_percent,
+                "Variance %": format_percent,
+                "Variance SP": format_number,
+            }
+        )
+        .applymap(status_cell_style, subset=["Status"])
+        .applymap(variance_cell_style, subset=["Variance %", "Variance SP"])
+        .applymap(lambda _: "font-weight: 700; background-color: #e8f0fe;", subset=[metric_column])
+    )
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+
+def render_dashboard_charts(summary: pd.DataFrame) -> None:
+    chart_summary = summary[summary["allocation_category"] != "Unmapped"].copy()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        sp_data = chart_summary.melt(
+            id_vars="allocation_category",
+            value_vars=["target_points", "actual_points"],
+            var_name="Metric",
+            value_name="Story Points",
+        )
+        sp_data["Metric"] = sp_data["Metric"].map({"target_points": "Target SP", "actual_points": "Actual SP"})
+        fig = px.bar(
+            sp_data,
+            x="allocation_category",
+            y="Story Points",
+            color="Metric",
+            barmode="group",
+            title="Target SP vs Actual SP by category",
+            template=PLOTLY_TEMPLATE,
+            color_discrete_map={"Target SP": LOOKER_COLORS["gray"], "Actual SP": LOOKER_COLORS["blue"]},
+        )
+        fig.update_layout(xaxis_title="", yaxis_title="Story points")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        variance_data = chart_summary.copy()
+        variance_data["Color"] = variance_data["variance_percentage"].map(variance_bucket)
+        fig = px.bar(
+            variance_data,
+            x="allocation_category",
+            y="variance_percentage",
+            color="Color",
+            title="Variance percentage by category",
+            template=PLOTLY_TEMPLATE,
+            color_discrete_map={
+                "healthy": LOOKER_COLORS["green"],
+                "watch": LOOKER_COLORS["yellow"],
+                "over": LOOKER_COLORS["red"],
+                "under": LOOKER_COLORS["gray"],
+            },
+        )
+        fig.update_layout(xaxis_title="", yaxis_title="Variance percentage", showlegend=False)
+        fig.add_hline(y=0, line_width=1, line_dash="dash", line_color=LOOKER_COLORS["muted"])
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_ticket_detail_table(issues: pd.DataFrame) -> None:
+    detail = analytics.ensure_issue_schema(issues).copy()
+    detail["epic"] = detail.apply(
+        lambda row: f"{row['epic_key']} - {row['epic_name']}".strip(" -"),
+        axis=1,
+    )
+    detail = detail[
+        ["ticket_key", "summary", "epic", "story_points", "allocation_category", "status", "assignee"]
+    ].sort_values(["allocation_category", "ticket_key"])
+    search_text = st.text_input(
+        "Search ticket detail",
+        placeholder="Filter by ticket, summary, epic, status, assignee",
+        key="dashboard_ticket_detail_search",
+    )
+    if search_text:
+        searchable = detail.astype(str).agg(" ".join, axis=1)
+        detail = detail[searchable.str.contains(search_text, case=False, regex=False, na=False)]
+    st.dataframe(
+        detail.style.applymap(category_cell_style, subset=["allocation_category"]),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def capacity_status(capacity_percent: float) -> str:
+    if capacity_percent > 110:
+        return "over capacity"
+    if capacity_percent > 100:
+        return "watch"
+    return "healthy"
+
+
+def capacity_color(capacity_percent: float) -> str:
+    return status_color(capacity_status(capacity_percent))
+
+
+def variance_bucket(value: object) -> str:
+    if pd.isna(value):
+        return "neutral"
+    variance = float(value)
+    if abs(variance) <= 5:
+        return "healthy"
+    if 5 < variance <= 15:
+        return "watch"
+    if variance > 15:
+        return "over"
+    return "under"
+
+
+def variance_color(value: object) -> str:
+    return {
+        "healthy": LOOKER_COLORS["green"],
+        "watch": LOOKER_COLORS["yellow"],
+        "over": LOOKER_COLORS["red"],
+        "under": LOOKER_COLORS["gray"],
+        "neutral": LOOKER_COLORS["gray"],
+    }[variance_bucket(value)]
+
+
+def status_color(status: str) -> str:
+    normalized = str(status).lower()
+    if normalized in {"healthy", "on target"}:
+        return LOOKER_COLORS["green"]
+    if normalized == "watch":
+        return LOOKER_COLORS["yellow"]
+    if normalized in {"over target", "over capacity", "over"}:
+        return LOOKER_COLORS["red"]
+    return LOOKER_COLORS["gray"]
+
+
+def status_background(status: str) -> str:
+    normalized = str(status).lower()
+    if normalized in {"healthy", "on target"}:
+        return "#e6f4ea"
+    if normalized == "watch":
+        return "#fef7e0"
+    if normalized in {"over target", "over capacity", "over"}:
+        return "#fce8e6"
+    return "#f1f3f4"
+
+
+def status_cell_style(value: object) -> str:
+    status = str(value)
+    color = status_color(status)
+    background = status_background(status)
+    return f"background-color: {background}; color: {color}; font-weight: 700;"
+
+
+def variance_cell_style(value: object) -> str:
+    if pd.isna(value):
+        return f"background-color: #f1f3f4; color: {LOOKER_COLORS['gray']};"
+    color = variance_color(value)
+    return f"color: {color}; font-weight: 700;"
+
+
+def category_cell_style(value: object) -> str:
+    if str(value) == "Unmapped":
+        return f"background-color: #f1f3f4; color: {LOOKER_COLORS['gray']}; font-weight: 700;"
+    return ""
 
 
 def ticket_mapping_editor_rows(issues: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
