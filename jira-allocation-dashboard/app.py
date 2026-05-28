@@ -13,7 +13,16 @@ import streamlit as st
 import analytics
 import config
 from jira_client import JiraClient, JiraClientError, JiraSettings, sample_issues
-from styles import LOOKER_COLORS, PLOTLY_TEMPLATE, apply_page_styles
+from styles import (
+    LOOKER_COLORS,
+    PLOTLY_TEMPLATE,
+    apply_page_styles,
+    capacity_color as style_capacity_color,
+    format_percent as style_format_percent,
+    format_points as style_format_points,
+    status_color as style_status_color,
+    variance_color as style_variance_color,
+)
 
 
 NAVIGATION_PAGES = [
@@ -392,16 +401,20 @@ def render_dashboard_kpis(
     )
 
     kpis = [
-        ("Sprint Capacity Goal", f"{config.SPRINT_CAPACITY_POINTS:.0f} pts", "Fixed denominator"),
-        ("Total Pointed Work", f"{capacity_usage['total_story_points']:.0f} pts", f"{len(filtered_issues)} tickets"),
+        ("Sprint Capacity Goal", f"{style_format_points(config.SPRINT_CAPACITY_POINTS)} pts", "Fixed denominator"),
+        (
+            "Total Pointed Work",
+            f"{style_format_points(capacity_usage['total_story_points'])} pts",
+            f"{len(filtered_issues)} tickets",
+        ),
         (
             "Capacity Used %",
-            f"{capacity_usage['total_capacity_percent']:.1f}%",
-            f"{capacity_usage['over_under_capacity_story_points']:+.0f} pts vs goal",
+            format_unsigned_percent(capacity_usage["total_capacity_percent"]),
+            f"{format_signed_points(capacity_usage['over_under_capacity_story_points'])} pts vs goal",
         ),
-        ("BPL Actual %", f"{bpl_actual:.1f}%", "Target 45.0%"),
-        ("BPL Variance vs Target", f"{bpl_variance:+.1f} pp", "Actual minus target"),
-        ("Unmapped Story Points", f"{unmapped_points:.0f} pts", "Needs categorization"),
+        ("BPL Actual %", format_unsigned_percent(bpl_actual), "Target 45%"),
+        ("BPL Variance vs Target", format_signed_percent(bpl_variance), "Actual minus target"),
+        ("Unmapped Story Points", f"{style_format_points(unmapped_points)} pts", "Needs categorization"),
     ]
 
     columns = st.columns(6)
@@ -426,9 +439,9 @@ def render_kpi_card(label: str, value: str, delta: str, color: str) -> None:
 def kpi_color(label: str, value: str, bpl_variance: float, capacity_usage: dict[str, float]) -> str:
     del value
     if label == "Capacity Used %":
-        return capacity_color(capacity_usage["total_capacity_percent"])
+        return style_capacity_color(capacity_usage["total_capacity_percent"])
     if label == "BPL Variance vs Target":
-        return variance_color(bpl_variance)
+        return style_variance_color(bpl_variance)
     if label == "Unmapped Story Points":
         return LOOKER_COLORS["gray"]
     return LOOKER_COLORS["blue"]
@@ -441,23 +454,27 @@ def render_resourcing_team_level(
     del all_capacity_usage
     capacity_percent = capacity_usage["total_capacity_percent"]
     status = capacity_status(capacity_percent)
+    capacity_background = style_capacity_color(capacity_percent)
     table = pd.DataFrame(
         [
             {
                 "Team": "ECOMM Cheeseburger",
-                "Pointed Work": f"{capacity_usage['total_story_points']:.0f} pts",
-                "Capacity Goal": f"{capacity_usage['sprint_capacity_points']:.0f} pts",
+                "Pointed Work": f"{style_format_points(capacity_usage['total_story_points'])} pts",
+                "Capacity Goal": f"{style_format_points(capacity_usage['sprint_capacity_points'])} pts",
                 "Usage": (
-                    f"{capacity_usage['total_story_points']:.0f} / "
-                    f"{capacity_usage['sprint_capacity_points']:.0f} = {capacity_percent:.1f}%"
+                    f"{style_format_points(capacity_usage['total_story_points'])} / "
+                    f"{style_format_points(capacity_usage['sprint_capacity_points'])} = "
+                    f"{format_unsigned_percent(capacity_percent)}"
                 ),
-                "Over / Under": f"{capacity_usage['over_under_capacity_story_points']:+.0f} pts",
+                "Over / Under": f"{format_signed_points(capacity_usage['over_under_capacity_story_points'])} pts",
                 "Status": status,
             }
         ]
     )
     st.dataframe(
-        table.style.applymap(lambda _: f"background-color: {status_background(status)}", subset=["Status"]),
+        table.style.applymap(lambda _: f"background-color: {capacity_background};", subset=["Usage"]).applymap(
+            lambda _: f"background-color: {status_background(status)}", subset=["Status"]
+        ),
         hide_index=True,
         use_container_width=True,
     )
@@ -491,12 +508,12 @@ def render_allocation_category_level(summary: pd.DataFrame, selected_metric: str
     styled = (
         display.style.format(
             {
-                "Target %": format_percent,
-                "Target SP": format_number,
-                "Actual SP": format_number,
-                "Actual %": format_percent,
-                "Variance %": format_percent,
-                "Variance SP": format_number,
+                "Target %": format_unsigned_percent,
+                "Target SP": style_format_points,
+                "Actual SP": style_format_points,
+                "Actual %": format_unsigned_percent,
+                "Variance %": format_signed_percent,
+                "Variance SP": format_signed_points,
             }
         )
         .applymap(status_cell_style, subset=["Status"])
@@ -578,15 +595,11 @@ def render_ticket_detail_table(issues: pd.DataFrame) -> None:
 
 
 def capacity_status(capacity_percent: float) -> str:
-    if capacity_percent > 110:
+    if capacity_percent >= 100:
         return "over capacity"
-    if capacity_percent > 100:
+    if capacity_percent >= 50:
         return "watch"
     return "healthy"
-
-
-def capacity_color(capacity_percent: float) -> str:
-    return status_color(capacity_status(capacity_percent))
 
 
 def variance_bucket(value: object) -> str:
@@ -599,28 +612,7 @@ def variance_bucket(value: object) -> str:
         return "watch"
     if variance > 15:
         return "over"
-    return "under"
-
-
-def variance_color(value: object) -> str:
-    return {
-        "healthy": LOOKER_COLORS["green"],
-        "watch": LOOKER_COLORS["yellow"],
-        "over": LOOKER_COLORS["red"],
-        "under": LOOKER_COLORS["gray"],
-        "neutral": LOOKER_COLORS["gray"],
-    }[variance_bucket(value)]
-
-
-def status_color(status: str) -> str:
-    normalized = str(status).lower()
-    if normalized in {"healthy", "on target"}:
-        return LOOKER_COLORS["green"]
-    if normalized == "watch":
-        return LOOKER_COLORS["yellow"]
-    if normalized in {"over target", "over capacity", "over"}:
-        return LOOKER_COLORS["red"]
-    return LOOKER_COLORS["gray"]
+        return "under"
 
 
 def status_background(status: str) -> str:
@@ -636,7 +628,7 @@ def status_background(status: str) -> str:
 
 def status_cell_style(value: object) -> str:
     status = str(value)
-    color = status_color(status)
+    color = style_status_color(status, "status")
     background = status_background(status)
     return f"background-color: {background}; color: {color}; font-weight: 700;"
 
@@ -644,7 +636,7 @@ def status_cell_style(value: object) -> str:
 def variance_cell_style(value: object) -> str:
     if pd.isna(value):
         return f"background-color: #f1f3f4; color: {LOOKER_COLORS['gray']};"
-    color = variance_color(value)
+    color = style_variance_color(value)
     return f"color: {color}; font-weight: 700;"
 
 
@@ -825,10 +817,12 @@ def render_tables(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
     st.subheader("Dashboard tables")
 
     formatted_summary = summary.copy()
-    for column in ["target_percentage", "actual_percentage", "variance_percentage"]:
-        formatted_summary[column] = formatted_summary[column].map(format_percent)
+    for column in ["target_percentage", "actual_percentage"]:
+        formatted_summary[column] = formatted_summary[column].map(format_unsigned_percent)
+    formatted_summary["variance_percentage"] = formatted_summary["variance_percentage"].map(format_signed_percent)
     for column in ["target_points", "actual_points", "variance_points"]:
-        formatted_summary[column] = formatted_summary[column].map(format_number)
+        formatter = format_signed_points if column == "variance_points" else style_format_points
+        formatted_summary[column] = formatted_summary[column].map(formatter)
 
     st.dataframe(
         formatted_summary[
@@ -870,16 +864,21 @@ def render_export(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
     )
 
 
-def format_percent(value: object) -> str:
-    if pd.isna(value):
-        return "-"
-    return f"{float(value):.1f}%"
+def format_unsigned_percent(value: object) -> str:
+    return style_format_percent(value).lstrip("+")
 
 
-def format_number(value: object) -> str:
+def format_signed_percent(value: object) -> str:
+    return style_format_percent(value)
+
+
+def format_signed_points(value: object) -> str:
     if pd.isna(value):
         return "-"
-    return f"{float(value):.1f}"
+    numeric = float(value)
+    if numeric > 0:
+        return f"+{style_format_points(numeric)}"
+    return style_format_points(numeric)
 
 
 if __name__ == "__main__":
