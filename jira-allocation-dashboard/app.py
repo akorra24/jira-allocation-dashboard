@@ -15,6 +15,14 @@ from jira_client import JiraClient, JiraClientError, JiraSettings, sample_issues
 from styles import LOOKER_COLORS, PLOTLY_TEMPLATE, apply_page_styles
 
 
+NAVIGATION_PAGES = [
+    "Dashboard",
+    "Ticket Mapping",
+    "Jira Field Discovery",
+    "Settings / Export",
+]
+
+
 st.set_page_config(
     page_title="ECOMM Cheeseburger Sprint Allocation",
     page_icon="EC",
@@ -26,24 +34,70 @@ apply_page_styles()
 def main() -> None:
     render_header()
 
-    sprint_name = render_sidebar()
-    if JiraSettings().is_configured and not config.STORY_POINTS_FIELD:
-        st.warning(
-            "STORY_POINTS_FIELD is not configured. Live Jira issues will default story_points to 0. "
-            "Use the Jira fields endpoint/helper to identify the Story Points custom field id."
-        )
+    page, sprint_name = render_sidebar()
+    if page == "Jira Field Discovery":
+        render_jira_field_discovery_page()
+        return
+
+    render_story_points_warning()
     raw_issues = load_issues(sprint_name)
     mapping = analytics.load_allocation_mapping()
     targets = analytics.load_sprint_targets()
     mapped_issues = analytics.apply_allocation_mapping(raw_issues, mapping)
+    summary = analytics.summarize_allocations(mapped_issues, targets)
 
+    if page == "Dashboard":
+        render_dashboard_page(mapped_issues, summary)
+    elif page == "Ticket Mapping":
+        render_ticket_mapping_page(raw_issues, mapped_issues, mapping, targets)
+    elif page == "Settings / Export":
+        render_settings_export_page(mapped_issues, summary)
+
+
+def render_dashboard_page(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
+    render_scorecards(issues, summary)
+    render_charts(summary, issues)
+    render_tables(summary, issues)
+
+
+def render_ticket_mapping_page(
+    raw_issues: pd.DataFrame,
+    mapped_issues: pd.DataFrame,
+    mapping: pd.DataFrame,
+    targets: pd.DataFrame,
+) -> None:
     current_issues = render_allocation_editor(raw_issues, mapped_issues, mapping)
     summary = analytics.summarize_allocations(current_issues, targets)
-
     render_scorecards(current_issues, summary)
-    render_charts(summary, current_issues)
     render_tables(summary, current_issues)
-    render_export(summary, current_issues)
+
+
+def render_settings_export_page(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
+    st.subheader("Settings / Export")
+    st.caption("Review active configuration and export the current sprint allocation snapshot.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("**Jira configuration**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Setting": "JIRA_BASE_URL", "Value": config.JIRA_BASE_URL or "Not configured"},
+                    {"Setting": "JIRA_PROJECT_KEY", "Value": config.JIRA_PROJECT_KEY or "Not configured"},
+                    {"Setting": "JIRA_BOARD_ID", "Value": config.JIRA_BOARD_ID or "Not configured"},
+                    {"Setting": "STORY_POINTS_FIELD", "Value": config.STORY_POINTS_FIELD or "Not configured"},
+                    {"Setting": "SPRINT_FIELD", "Value": config.SPRINT_FIELD or "Not configured"},
+                    {"Setting": "EPIC_FIELD", "Value": config.EPIC_FIELD or "Not configured"},
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+    with col2:
+        st.write("**Allocation targets**")
+        st.dataframe(analytics.load_sprint_targets(), hide_index=True, use_container_width=True)
+
+    render_export(summary, issues)
 
 
 def render_header() -> None:
@@ -59,10 +113,14 @@ def render_header() -> None:
     )
 
 
-def render_sidebar() -> str:
+def render_sidebar() -> tuple[str, str]:
     settings = JiraSettings()
 
     with st.sidebar:
+        st.header("Navigation")
+        page = st.radio("Page", NAVIGATION_PAGES, label_visibility="collapsed")
+
+        st.divider()
         st.header("Sprint controls")
         sprint_name = st.text_input(
             "Sprint name",
@@ -81,7 +139,71 @@ def render_sidebar() -> str:
         st.caption("Set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in .env to enable live Jira data.")
         st.metric("Sprint capacity", f"{config.SPRINT_CAPACITY_POINTS} pts")
 
-    return sprint_name
+    return page, sprint_name
+
+
+def render_story_points_warning() -> None:
+    if JiraSettings().is_configured and not config.STORY_POINTS_FIELD:
+        st.warning(
+            "STORY_POINTS_FIELD is not configured. Live Jira issues will default story_points to 0. "
+            "Use the Jira Field Discovery page to identify the Story Points custom field id."
+        )
+
+
+def render_jira_field_discovery_page() -> None:
+    st.subheader("Jira Field Discovery")
+    st.caption(
+        "Use this page to identify the Jira custom field ids needed in `.env`, including the Story Points, "
+        "Sprint, Epic, and any future Allocation fields."
+    )
+
+    settings = JiraSettings()
+    client = JiraClient(settings)
+
+    if settings.is_configured:
+        st.success("Jira credentials are configured.")
+        st.caption(f"Connected base URL: {settings.base_url}")
+    else:
+        st.warning("Jira credentials are missing or incomplete.")
+        st.markdown("Create `.env` from `.env.example`, then add Jira credentials and field ids:")
+        st.code(load_env_example_text(), language="dotenv")
+        return
+
+    st.info(
+        "Search for terms like `story`, `points`, `sprint`, or `epic`. Copy the matching field `id` "
+        "into `.env` for STORY_POINTS_FIELD, SPRINT_FIELD, and EPIC_FIELD."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Test Jira Connection", type="primary", use_container_width=True):
+            st.session_state["jira_connection_result"] = client.test_connection()
+    with col2:
+        if st.button("Load Jira Fields", use_container_width=True):
+            try:
+                st.session_state["jira_fields"] = client.get_fields()
+                st.session_state["jira_fields_error"] = None
+            except JiraClientError as exc:
+                st.session_state["jira_fields"] = pd.DataFrame()
+                st.session_state["jira_fields_error"] = str(exc)
+
+    render_connection_result(st.session_state.get("jira_connection_result"))
+
+    if st.session_state.get("jira_fields_error"):
+        st.error(st.session_state["jira_fields_error"])
+
+    fields = st.session_state.get("jira_fields")
+    if isinstance(fields, pd.DataFrame) and not fields.empty:
+        search_text = st.text_input(
+            "Filter fields",
+            placeholder="Try story, sprint, epic, points",
+            key="jira_field_search_text",
+        )
+        filtered_fields = filter_fields(fields, search_text)
+        st.dataframe(filtered_fields, hide_index=True, use_container_width=True)
+        st.caption(f"Showing {len(filtered_fields)} of {len(fields)} Jira fields.")
+    else:
+        st.caption('Click "Load Jira Fields" to fetch fields from Jira.')
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -92,6 +214,43 @@ def load_issues(sprint_name: str) -> pd.DataFrame:
     except JiraClientError as exc:
         st.warning(f"Jira request failed, using sample data instead: {exc}")
         return sample_issues(sprint_name)
+
+
+def render_connection_result(result: dict | None) -> None:
+    if not result:
+        return
+
+    if result.get("success"):
+        st.success("Jira connection succeeded.")
+        st.dataframe(pd.DataFrame([result.get("user", {})]), hide_index=True, use_container_width=True)
+    else:
+        st.error(result.get("error", "Jira connection failed."))
+
+
+def filter_fields(fields: pd.DataFrame, search_text: str) -> pd.DataFrame:
+    if not search_text:
+        return fields
+
+    searchable = fields.astype(str).agg(" ".join, axis=1)
+    mask = searchable.str.contains(search_text, case=False, regex=False, na=False)
+    return fields[mask]
+
+
+def load_env_example_text() -> str:
+    env_example_path = config.APP_DIR / ".env.example"
+    try:
+        return env_example_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return (
+            "JIRA_BASE_URL=https://your-domain.atlassian.net\n"
+            "JIRA_EMAIL=your-email@example.com\n"
+            "JIRA_API_TOKEN=your-api-token\n"
+            "JIRA_PROJECT_KEY=ECOMM\n"
+            "JIRA_BOARD_ID=your-board-id\n"
+            "STORY_POINTS_FIELD=your-story-points-field-id\n"
+            "SPRINT_FIELD=your-sprint-field-id\n"
+            "EPIC_FIELD=your-epic-field-id"
+        )
 
 
 def render_allocation_editor(
