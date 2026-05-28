@@ -73,10 +73,10 @@ JIRA_BASE_URL=https://your-domain.atlassian.net
 JIRA_EMAIL=your-email@example.com
 JIRA_API_TOKEN=your-api-token
 JIRA_PROJECT_KEY=ECOMM
-JIRA_BOARD_ID=123
-STORY_POINTS_FIELD=customfield_10016
-SPRINT_FIELD=Sprint
-EPIC_FIELD=parent
+JIRA_BOARD_ID=your-board-id
+STORY_POINTS_FIELD=your-story-points-field-id
+SPRINT_FIELD=your-sprint-field-id
+EPIC_FIELD=your-epic-field-id
 ```
 
 Do not commit `.env`; it is ignored by git.

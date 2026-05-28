@@ -41,9 +41,9 @@ JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "")
 JIRA_BOARD_ID = os.getenv("JIRA_BOARD_ID", "")
 JIRA_DEFAULT_SPRINT = os.getenv("JIRA_DEFAULT_SPRINT", "")
 JIRA_VERIFY_SSL = os.getenv("JIRA_VERIFY_SSL", "true").lower() not in {"0", "false", "no"}
-STORY_POINTS_FIELD = os.getenv("STORY_POINTS_FIELD", "customfield_10016")
-SPRINT_FIELD = os.getenv("SPRINT_FIELD", "Sprint")
-EPIC_FIELD = os.getenv("EPIC_FIELD", "parent")
+STORY_POINTS_FIELD = os.getenv("STORY_POINTS_FIELD", "").strip()
+SPRINT_FIELD = os.getenv("SPRINT_FIELD", "").strip()
+EPIC_FIELD = os.getenv("EPIC_FIELD", "").strip()
 
 ALLOCATION_MAPPING_PATH = DATA_DIR / "allocation_mapping.csv"
 SPRINT_TARGETS_PATH = DATA_DIR / "sprint_targets.csv"

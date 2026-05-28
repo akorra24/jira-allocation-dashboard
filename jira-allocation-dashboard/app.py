@@ -7,12 +7,11 @@ from io import BytesIO
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 
 import analytics
 import config
-from jira_client import JiraClient, JiraSettings
+from jira_client import JiraClient, JiraClientError, JiraSettings, sample_issues
 from styles import LOOKER_COLORS, PLOTLY_TEMPLATE, apply_page_styles
 
 
@@ -28,6 +27,11 @@ def main() -> None:
     render_header()
 
     sprint_name = render_sidebar()
+    if JiraSettings().is_configured and not config.STORY_POINTS_FIELD:
+        st.warning(
+            "STORY_POINTS_FIELD is not configured. Live Jira issues will default story_points to 0. "
+            "Use the Jira fields endpoint/helper to identify the Story Points custom field id."
+        )
     raw_issues = load_issues(sprint_name)
     mapping = analytics.load_allocation_mapping()
     targets = analytics.load_sprint_targets()
@@ -84,10 +88,10 @@ def render_sidebar() -> str:
 def load_issues(sprint_name: str) -> pd.DataFrame:
     client = JiraClient()
     try:
-        return client.fetch_issues_for_sprint(sprint_name)
-    except requests.RequestException as exc:
+        return pd.DataFrame(client.get_issues_for_sprint(sprint_name))
+    except JiraClientError as exc:
         st.warning(f"Jira request failed, using sample data instead: {exc}")
-        return JiraClient().fetch_issues_for_sprint(None)
+        return sample_issues(sprint_name)
 
 
 def render_allocation_editor(
