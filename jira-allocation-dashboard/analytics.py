@@ -9,7 +9,9 @@ import pandas as pd
 import config
 
 
-MAPPING_COLUMNS = ["mapping_type", "mapping_key", "allocation_category", "notes"]
+MAPPING_COLUMNS = ["mapping_level", "jira_key", "summary", "allocation_category", "notes", "last_updated"]
+MAPPING_LEVELS = ["Ticket", "Epic"]
+VALID_ALLOCATION_CATEGORIES = [*config.ALLOCATION_CATEGORIES, "Unmapped"]
 TARGET_COLUMNS = ["allocation_category", "target_percentage"]
 
 
@@ -19,15 +21,17 @@ def load_allocation_mapping(path: Path = config.ALLOCATION_MAPPING_PATH) -> pd.D
     else:
         mapping = pd.DataFrame(columns=MAPPING_COLUMNS)
 
+    mapping = _migrate_legacy_mapping(mapping)
     for column in MAPPING_COLUMNS:
         if column not in mapping.columns:
             mapping[column] = ""
-    return mapping[MAPPING_COLUMNS].fillna("")
+    return _clean_mapping(mapping)
 
 
 def save_allocation_mapping(mapping: pd.DataFrame, path: Path = config.ALLOCATION_MAPPING_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    mapping = mapping[MAPPING_COLUMNS].drop_duplicates(["mapping_type", "mapping_key"], keep="last")
+    mapping = _clean_mapping(mapping)
+    mapping = mapping.drop_duplicates(["mapping_level", "jira_key"], keep="last")
     mapping.to_csv(path, index=False)
 
 
@@ -47,27 +51,24 @@ def load_sprint_targets(path: Path = config.SPRINT_TARGETS_PATH) -> pd.DataFrame
 
 
 def apply_allocation_mapping(issues: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
-    """Apply epic-level mappings first, then issue-level overrides."""
+    """Apply ticket mappings first, then epic mappings, otherwise mark as Unmapped."""
     issues = ensure_issue_schema(issues).copy()
-    mapping = mapping.fillna("")
+    mapping = _clean_mapping(mapping)
 
-    epic_map = _mapping_dict(mapping, "epic")
-    issue_map = _mapping_dict(mapping, "issue")
+    epic_map = _mapping_dict(mapping, "Epic")
+    ticket_map = _mapping_dict(mapping, "Ticket")
 
-    issues["mapped_allocation_category"] = issues["allocation_category"].fillna("")
-    issues.loc[issues["mapped_allocation_category"] == "", "mapped_allocation_category"] = issues[
-        "epic_key"
-    ].map(epic_map)
-    issues["mapped_allocation_category"] = issues["mapped_allocation_category"].fillna("")
+    ticket_keys = issues["ticket_key"].fillna("").astype(str)
+    epic_keys = issues["epic_key"].fillna("").astype(str)
+    issues["allocation_category"] = ticket_keys.map(ticket_map)
+    issues["allocation_category"] = issues["allocation_category"].fillna(epic_keys.map(epic_map))
+    issues["allocation_category"] = issues["allocation_category"].fillna("Unmapped")
 
-    issue_assignments = issues["issue_key"].map(issue_map)
-    issues.loc[issue_assignments.notna() & (issue_assignments != ""), "mapped_allocation_category"] = (
-        issue_assignments
-    )
     issues.loc[
-        ~issues["mapped_allocation_category"].isin(config.ALLOCATION_CATEGORIES),
-        "mapped_allocation_category",
-    ] = "Unassigned"
+        ~issues["allocation_category"].isin(VALID_ALLOCATION_CATEGORIES),
+        "allocation_category",
+    ] = "Unmapped"
+    issues["mapped_allocation_category"] = issues["allocation_category"]
 
     issues["story_points"] = pd.to_numeric(issues["story_points"], errors="coerce").fillna(0)
     return issues
@@ -114,7 +115,7 @@ def epic_rollup(issues: pd.DataFrame) -> pd.DataFrame:
 
 def issue_editor_rows(issues: pd.DataFrame) -> pd.DataFrame:
     columns = [
-        "issue_key",
+        "ticket_key",
         "issue_type",
         "summary",
         "epic_key",
@@ -122,34 +123,10 @@ def issue_editor_rows(issues: pd.DataFrame) -> pd.DataFrame:
         "status",
         "assignee",
         "story_points",
-        "mapped_allocation_category",
+        "allocation_category",
+        "notes",
     ]
     return ensure_issue_schema(issues)[columns]
-
-
-def mappings_from_editor(edited_issues: pd.DataFrame, edited_epics: pd.DataFrame) -> pd.DataFrame:
-    issue_rows = pd.DataFrame(
-        {
-            "mapping_type": "issue",
-            "mapping_key": edited_issues["issue_key"],
-            "allocation_category": edited_issues["mapped_allocation_category"],
-            "notes": "",
-        }
-    )
-
-    epic_rows = pd.DataFrame(
-        {
-            "mapping_type": "epic",
-            "mapping_key": edited_epics["epic_key"],
-            "allocation_category": edited_epics["mapped_allocation_category"],
-            "notes": "",
-        }
-    )
-
-    mapping = pd.concat([issue_rows, epic_rows], ignore_index=True)
-    mapping = mapping[mapping["allocation_category"].isin(config.ALLOCATION_CATEGORIES)]
-    mapping = mapping[mapping["mapping_key"].astype(str).str.len() > 0]
-    return mapping[MAPPING_COLUMNS].drop_duplicates(["mapping_type", "mapping_key"], keep="last")
 
 
 def classify_variance(variance_percentage: float) -> str:
@@ -164,6 +141,8 @@ def classify_variance(variance_percentage: float) -> str:
 def ensure_issue_schema(issues: pd.DataFrame) -> pd.DataFrame:
     expected_columns = {
         "sprint_name": "",
+        "sprint": "",
+        "ticket_key": "",
         "issue_key": "",
         "issue_type": "",
         "summary": "",
@@ -172,18 +151,66 @@ def ensure_issue_schema(issues: pd.DataFrame) -> pd.DataFrame:
         "status": "",
         "assignee": "",
         "story_points": 0,
-        "allocation_category": "",
-        "mapped_allocation_category": "",
+        "allocation_category": "Unmapped",
+        "mapped_allocation_category": "Unmapped",
+        "notes": "",
     }
     issues = issues.copy()
     for column, default in expected_columns.items():
         if column not in issues.columns:
             issues[column] = default
+    issues["ticket_key"] = issues["ticket_key"].fillna("")
+    issues.loc[issues["ticket_key"] == "", "ticket_key"] = issues["issue_key"]
+    issues["issue_key"] = issues["issue_key"].fillna("")
+    issues.loc[issues["issue_key"] == "", "issue_key"] = issues["ticket_key"]
     return issues
 
 
-def _mapping_dict(mapping: pd.DataFrame, mapping_type: str) -> dict[str, str]:
-    filtered = mapping[mapping["mapping_type"].str.lower() == mapping_type]
-    filtered = filtered[filtered["allocation_category"].isin(config.ALLOCATION_CATEGORIES)]
-    return dict(zip(filtered["mapping_key"], filtered["allocation_category"], strict=False))
+def _mapping_dict(mapping: pd.DataFrame, mapping_level: str) -> dict[str, str]:
+    filtered = mapping[mapping["mapping_level"] == mapping_level]
+    filtered = filtered[filtered["allocation_category"].isin(VALID_ALLOCATION_CATEGORIES)]
+    return dict(zip(filtered["jira_key"], filtered["allocation_category"], strict=False))
+
+
+def _clean_mapping(mapping: pd.DataFrame) -> pd.DataFrame:
+    mapping = mapping.copy().fillna("")
+    for column in MAPPING_COLUMNS:
+        if column not in mapping.columns:
+            mapping[column] = ""
+    mapping["mapping_level"] = mapping["mapping_level"].map(_normalize_mapping_level)
+    mapping["allocation_category"] = mapping["allocation_category"].map(_normalize_allocation_category)
+    mapping["jira_key"] = mapping["jira_key"].astype(str).str.strip()
+    mapping = mapping[mapping["mapping_level"].isin(MAPPING_LEVELS)]
+    mapping = mapping[mapping["jira_key"] != ""]
+    return mapping[MAPPING_COLUMNS].fillna("")
+
+
+def _migrate_legacy_mapping(mapping: pd.DataFrame) -> pd.DataFrame:
+    if {"mapping_type", "mapping_key"}.issubset(mapping.columns) and "mapping_level" not in mapping.columns:
+        migrated = pd.DataFrame(
+            {
+                "mapping_level": mapping["mapping_type"].map(_normalize_mapping_level),
+                "jira_key": mapping["mapping_key"],
+                "summary": "",
+                "allocation_category": mapping.get("allocation_category", ""),
+                "notes": mapping.get("notes", ""),
+                "last_updated": "",
+            }
+        )
+        return migrated
+    return mapping
+
+
+def _normalize_mapping_level(value: object) -> str:
+    text = str(value).strip().lower()
+    if text in {"ticket", "issue"}:
+        return "Ticket"
+    if text == "epic":
+        return "Epic"
+    return str(value).strip()
+
+
+def _normalize_allocation_category(value: object) -> str:
+    text = str(value).strip()
+    return text if text in VALID_ALLOCATION_CATEGORIES else "Unmapped"
 

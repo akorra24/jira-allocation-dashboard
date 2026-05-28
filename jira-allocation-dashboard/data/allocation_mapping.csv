@@ -1,6 +1,6 @@
-mapping_type,mapping_key,allocation_category,notes
-epic,ECOMM-10,Product/BPL,Sample BPL epic assignment
-epic,ECOMM-20,Marketing,Sample marketing epic assignment
-epic,ECOMM-30,ETO System Feature,Sample platform feature assignment
-epic,ECOMM-40,Security,Sample security epic assignment
-epic,ECOMM-50,ETO System Maintenance,Sample maintenance epic assignment
+mapping_level,jira_key,summary,allocation_category,notes,last_updated
+Epic,ECOMM-10,BPL Cheeseburger Experience,Product/BPL,Sample BPL epic assignment,2026-05-28
+Epic,ECOMM-20,Marketing Campaign Enablement,Marketing,Sample marketing epic assignment,2026-05-28
+Epic,ECOMM-30,Commerce Platform Features,ETO System Feature,Sample platform feature assignment,2026-05-28
+Epic,ECOMM-40,Security Remediation,Security,Sample security epic assignment,2026-05-28
+Epic,ECOMM-50,Operational Maintenance,ETO System Maintenance,Sample maintenance epic assignment,2026-05-28

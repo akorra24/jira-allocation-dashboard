@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from io import BytesIO
 
 import pandas as pd
@@ -39,6 +40,11 @@ def main() -> None:
         render_jira_field_discovery_page()
         return
 
+    if page == "Ticket Mapping":
+        render_story_points_warning()
+        render_ticket_mapping_page(sprint_name)
+        return
+
     render_story_points_warning()
     raw_issues = load_issues(sprint_name)
     mapping = analytics.load_allocation_mapping()
@@ -48,8 +54,6 @@ def main() -> None:
 
     if page == "Dashboard":
         render_dashboard_page(mapped_issues, summary)
-    elif page == "Ticket Mapping":
-        render_ticket_mapping_page(raw_issues, mapped_issues, mapping, targets)
     elif page == "Settings / Export":
         render_settings_export_page(mapped_issues, summary)
 
@@ -60,16 +64,61 @@ def render_dashboard_page(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
     render_tables(summary, issues)
 
 
-def render_ticket_mapping_page(
-    raw_issues: pd.DataFrame,
-    mapped_issues: pd.DataFrame,
-    mapping: pd.DataFrame,
-    targets: pd.DataFrame,
-) -> None:
-    current_issues = render_allocation_editor(raw_issues, mapped_issues, mapping)
-    summary = analytics.summarize_allocations(current_issues, targets)
-    render_scorecards(current_issues, summary)
-    render_tables(summary, current_issues)
+def render_ticket_mapping_page(default_sprint_name: str) -> None:
+    st.subheader("Ticket Mapping")
+    st.caption("Pull sprint tickets, manually categorize them, and save ticket-level allocation mappings.")
+
+    sprint_name = st.text_input(
+        "Sprint name or ID",
+        value=default_sprint_name,
+        help="Used to pull Jira tickets. If Jira is unavailable, sample sprint tickets are shown.",
+        key="ticket_mapping_sprint_name",
+    )
+    raw_issues = load_issues(sprint_name)
+    mapping = analytics.load_allocation_mapping()
+    mapped_issues = analytics.apply_allocation_mapping(raw_issues, mapping)
+    editor_rows = ticket_mapping_editor_rows(mapped_issues, mapping)
+
+    unmapped_count = int((editor_rows["allocation_category"] == "Unmapped").sum())
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Tickets loaded", len(editor_rows))
+    col2.metric("Unmapped tickets", unmapped_count)
+    col3.metric("Mapped tickets", len(editor_rows) - unmapped_count)
+
+    edited_rows = st.data_editor(
+        editor_rows,
+        hide_index=True,
+        use_container_width=True,
+        disabled=["ticket_key", "summary", "issue_type", "story_points", "epic_key", "epic_name", "status"],
+        column_config={
+            "allocation_category": st.column_config.SelectboxColumn(
+                "Allocation category",
+                options=analytics.VALID_ALLOCATION_CATEGORIES,
+                required=True,
+            ),
+            "story_points": st.column_config.NumberColumn("Story points", min_value=0, step=1),
+            "notes": st.column_config.TextColumn("Notes"),
+        },
+        key="ticket_mapping_editor",
+    )
+
+    preview_issues = mapped_issues.drop(columns=["allocation_category", "mapped_allocation_category", "notes"], errors="ignore")
+    preview_issues = preview_issues.merge(
+        edited_rows[["ticket_key", "allocation_category", "notes"]],
+        how="left",
+        on="ticket_key",
+    )
+    preview_issues["mapped_allocation_category"] = preview_issues["allocation_category"]
+    summary = analytics.summarize_allocations(preview_issues, analytics.load_sprint_targets())
+
+    if st.button("Save Allocation Mapping", type="primary"):
+        updated_mapping = merge_ticket_mappings(mapping, mapping_from_ticket_editor(edited_rows))
+        analytics.save_allocation_mapping(updated_mapping)
+        st.success("Allocation mapping saved to data/allocation_mapping.csv.")
+        st.cache_data.clear()
+
+    render_scorecards(preview_issues, summary)
+    render_tables(summary, preview_issues)
 
 
 def render_settings_export_page(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
@@ -253,76 +302,64 @@ def load_env_example_text() -> str:
         )
 
 
-def render_allocation_editor(
-    raw_issues: pd.DataFrame,
-    mapped_issues: pd.DataFrame,
-    mapping: pd.DataFrame,
-) -> pd.DataFrame:
-    st.subheader("Allocation editor")
-    st.caption("Edit allocation categories at the epic or issue level. Issue-level mappings override epic mappings.")
+def ticket_mapping_editor_rows(issues: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
+    issues = analytics.ensure_issue_schema(issues)
+    note_map = mapping_notes_by_key(mapping)
+    rows = issues[
+        [
+            "ticket_key",
+            "summary",
+            "issue_type",
+            "story_points",
+            "epic_key",
+            "epic_name",
+            "status",
+            "allocation_category",
+        ]
+    ].copy()
+    rows["notes"] = rows["ticket_key"].map(note_map["Ticket"]).fillna(rows["epic_key"].map(note_map["Epic"]))
+    rows["notes"] = rows["notes"].fillna("")
+    return rows
 
-    mode = st.radio(
-        "Assignment level",
-        ["Epic-level", "Issue-level"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
 
-    category_options = ["Unassigned", *config.ALLOCATION_CATEGORIES]
-    column_config = {
-        "mapped_allocation_category": st.column_config.SelectboxColumn(
-            "Allocation category",
-            options=category_options,
-            required=True,
-        ),
-        "story_points": st.column_config.NumberColumn("Story points", min_value=0, step=1),
+def mapping_notes_by_key(mapping: pd.DataFrame) -> dict[str, dict[str, str]]:
+    mapping = analytics.load_allocation_mapping() if mapping.empty else mapping
+    ticket_notes = mapping[mapping["mapping_level"] == "Ticket"]
+    epic_notes = mapping[mapping["mapping_level"] == "Epic"]
+    return {
+        "Ticket": dict(zip(ticket_notes["jira_key"], ticket_notes["notes"], strict=False)),
+        "Epic": dict(zip(epic_notes["jira_key"], epic_notes["notes"], strict=False)),
     }
 
-    if mode == "Epic-level":
-        epic_rows = epic_editor_rows(mapped_issues)
-        edited_epics = st.data_editor(
-            epic_rows,
-            hide_index=True,
-            use_container_width=True,
-            disabled=["epic_key", "epic_name", "issue_count", "story_points"],
-            column_config=column_config,
-            key="epic_allocation_editor",
+
+def mapping_from_ticket_editor(edited_rows: pd.DataFrame) -> pd.DataFrame:
+    rows = edited_rows.copy()
+    rows["allocation_category"] = rows["allocation_category"].fillna("Unmapped")
+    rows.loc[
+        ~rows["allocation_category"].isin(analytics.VALID_ALLOCATION_CATEGORIES),
+        "allocation_category",
+    ] = "Unmapped"
+    return pd.DataFrame(
+        {
+            "mapping_level": "Ticket",
+            "jira_key": rows["ticket_key"],
+            "summary": rows["summary"],
+            "allocation_category": rows["allocation_category"],
+            "notes": rows["notes"].fillna(""),
+            "last_updated": date.today().isoformat(),
+        }
+    )
+
+
+def merge_ticket_mappings(existing_mapping: pd.DataFrame, ticket_mapping: pd.DataFrame) -> pd.DataFrame:
+    ticket_keys = set(ticket_mapping["jira_key"].astype(str))
+    retained = existing_mapping[
+        ~(
+            (existing_mapping["mapping_level"] == "Ticket")
+            & (existing_mapping["jira_key"].astype(str).isin(ticket_keys))
         )
-        current_mapping = replace_mapping_type(mapping, mapping_from_epics(edited_epics), "epic")
-        current_issues = analytics.apply_allocation_mapping(raw_issues, current_mapping)
-
-        if st.button("Save epic allocations", type="primary"):
-            analytics.save_allocation_mapping(current_mapping)
-            st.success("Epic allocation mappings saved to data/allocation_mapping.csv.")
-            st.cache_data.clear()
-
-        return current_issues
-
-    issue_rows = analytics.issue_editor_rows(mapped_issues)
-    edited_issues = st.data_editor(
-        issue_rows,
-        hide_index=True,
-        use_container_width=True,
-        disabled=["issue_key", "issue_type", "summary", "epic_key", "epic_name", "status", "assignee"],
-        column_config=column_config,
-        key="issue_allocation_editor",
-    )
-    current_mapping = replace_mapping_type(mapping, mapping_from_issues(edited_issues), "issue")
-    current_issues = raw_issues.copy()
-    current_issues = current_issues.merge(
-        edited_issues[["issue_key", "mapped_allocation_category"]],
-        how="left",
-        on="issue_key",
-    )
-    current_issues["allocation_category"] = current_issues["mapped_allocation_category"]
-    current_issues = analytics.ensure_issue_schema(current_issues)
-
-    if st.button("Save issue allocations", type="primary"):
-        analytics.save_allocation_mapping(current_mapping)
-        st.success("Issue allocation mappings saved to data/allocation_mapping.csv.")
-        st.cache_data.clear()
-
-    return current_issues
+    ]
+    return pd.concat([retained, ticket_mapping], ignore_index=True)
 
 
 def render_scorecards(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
@@ -477,59 +514,6 @@ def render_export(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
         file_name="sprint_allocation_dashboard.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-
-def epic_editor_rows(issues: pd.DataFrame) -> pd.DataFrame:
-    rows = (
-        issues.groupby(["epic_key", "epic_name"], dropna=False)
-        .agg(
-            issue_count=("issue_key", "count"),
-            story_points=("story_points", "sum"),
-            mapped_allocation_category=("mapped_allocation_category", first_category),
-        )
-        .reset_index()
-    )
-    rows.loc[rows["epic_key"].astype(str).str.len() == 0, "epic_key"] = "No epic"
-    return rows.sort_values("story_points", ascending=False)
-
-
-def first_category(values: pd.Series) -> str:
-    categories = [value for value in values if value in config.ALLOCATION_CATEGORIES]
-    return categories[0] if categories else "Unassigned"
-
-
-def mapping_from_epics(edited_epics: pd.DataFrame) -> pd.DataFrame:
-    rows = edited_epics[edited_epics["epic_key"] != "No epic"].copy()
-    rows = rows[rows["mapped_allocation_category"].isin(config.ALLOCATION_CATEGORIES)]
-    return pd.DataFrame(
-        {
-            "mapping_type": "epic",
-            "mapping_key": rows["epic_key"],
-            "allocation_category": rows["mapped_allocation_category"],
-            "notes": "",
-        }
-    )
-
-
-def mapping_from_issues(edited_issues: pd.DataFrame) -> pd.DataFrame:
-    rows = edited_issues[edited_issues["mapped_allocation_category"].isin(config.ALLOCATION_CATEGORIES)].copy()
-    return pd.DataFrame(
-        {
-            "mapping_type": "issue",
-            "mapping_key": rows["issue_key"],
-            "allocation_category": rows["mapped_allocation_category"],
-            "notes": "",
-        }
-    )
-
-
-def replace_mapping_type(existing: pd.DataFrame, replacement: pd.DataFrame, mapping_type: str) -> pd.DataFrame:
-    retained = existing[existing["mapping_type"].str.lower() != mapping_type]
-    combined = pd.concat([retained, replacement], ignore_index=True)
-    for column in analytics.MAPPING_COLUMNS:
-        if column not in combined.columns:
-            combined[column] = ""
-    return combined[analytics.MAPPING_COLUMNS]
 
 
 if __name__ == "__main__":
