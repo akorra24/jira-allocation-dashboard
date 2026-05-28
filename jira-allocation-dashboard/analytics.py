@@ -74,32 +74,124 @@ def apply_allocation_mapping(issues: pd.DataFrame, mapping: pd.DataFrame) -> pd.
     return issues
 
 
+def calculate_allocation_summary(issues_df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate target, actual, and variance metrics by allocation category."""
+    issues = ensure_issue_schema(issues_df)
+    issues["story_points"] = pd.to_numeric(issues["story_points"], errors="coerce").fillna(0)
+    issues["allocation_category"] = issues["allocation_category"].fillna("Unmapped")
+    issues.loc[
+        ~issues["allocation_category"].isin(VALID_ALLOCATION_CATEGORIES),
+        "allocation_category",
+    ] = "Unmapped"
+
+    grouped = (
+        issues.groupby("allocation_category", dropna=False)
+        .agg(
+            actual_story_points=("story_points", "sum"),
+            ticket_count=("ticket_key", "count"),
+        )
+        .reset_index()
+    )
+
+    target_rows = pd.DataFrame(
+        {
+            "allocation_category": config.ALLOCATION_CATEGORIES,
+            "target_percent": [config.ALLOCATION_TARGETS[category] for category in config.ALLOCATION_CATEGORIES],
+        }
+    )
+    summary = target_rows.merge(grouped, how="left", on="allocation_category")
+    summary["actual_story_points"] = summary["actual_story_points"].fillna(0)
+    summary["ticket_count"] = summary["ticket_count"].fillna(0).astype(int)
+    summary["target_story_points"] = summary["target_percent"] / 100 * config.SPRINT_CAPACITY_POINTS
+    summary["actual_percent_of_capacity"] = (
+        summary["actual_story_points"] / config.SPRINT_CAPACITY_POINTS * 100
+    )
+    summary["variance_percent"] = summary["actual_percent_of_capacity"] - summary["target_percent"]
+    summary["variance_story_points"] = summary["actual_story_points"] - summary["target_story_points"]
+
+    unmapped = grouped[grouped["allocation_category"] == "Unmapped"]
+    if not unmapped.empty:
+        unmapped_row = unmapped.iloc[0]
+        summary = pd.concat(
+            [
+                summary,
+                pd.DataFrame(
+                    [
+                        {
+                            "allocation_category": "Unmapped",
+                            "target_percent": 0,
+                            "target_story_points": 0,
+                            "actual_story_points": unmapped_row["actual_story_points"],
+                            "actual_percent_of_capacity": (
+                                unmapped_row["actual_story_points"] / config.SPRINT_CAPACITY_POINTS * 100
+                            ),
+                            "variance_percent": pd.NA,
+                            "variance_story_points": pd.NA,
+                            "ticket_count": int(unmapped_row["ticket_count"]),
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+
+    return summary[
+        [
+            "allocation_category",
+            "target_percent",
+            "target_story_points",
+            "actual_story_points",
+            "actual_percent_of_capacity",
+            "variance_percent",
+            "variance_story_points",
+            "ticket_count",
+        ]
+    ]
+
+
+def calculate_total_capacity_usage(issues_df: pd.DataFrame) -> dict[str, float]:
+    """Calculate total sprint point usage against the fixed sprint capacity."""
+    issues = ensure_issue_schema(issues_df)
+    total_story_points = pd.to_numeric(issues["story_points"], errors="coerce").fillna(0).sum()
+    sprint_capacity_points = config.SPRINT_CAPACITY_POINTS
+    total_capacity_percent = total_story_points / sprint_capacity_points * 100
+    over_under_capacity_story_points = total_story_points - sprint_capacity_points
+    over_under_capacity_percent = total_capacity_percent - 100
+
+    return {
+        "total_story_points": float(total_story_points),
+        "sprint_capacity_points": float(sprint_capacity_points),
+        "total_capacity_percent": float(total_capacity_percent),
+        "over_under_capacity_story_points": float(over_under_capacity_story_points),
+        "over_under_capacity_percent": float(over_under_capacity_percent),
+    }
+
+
+def calculate_sprint_health(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Add allocation health status by category using variance percentage thresholds."""
+    summary = summary_df.copy()
+    summary["health_status"] = summary.apply(_health_status, axis=1)
+    return summary
+
+
 def summarize_allocations(
     issues: pd.DataFrame,
     targets: pd.DataFrame,
     sprint_capacity: int = config.SPRINT_CAPACITY_POINTS,
 ) -> pd.DataFrame:
-    grouped = (
-        issues.groupby("mapped_allocation_category", dropna=False)["story_points"]
-        .sum()
-        .rename("actual_points")
-        .reset_index()
-        .rename(columns={"mapped_allocation_category": "allocation_category"})
+    del targets, sprint_capacity
+    summary = calculate_sprint_health(calculate_allocation_summary(issues))
+    summary = summary.rename(
+        columns={
+            "actual_story_points": "actual_points",
+            "target_story_points": "target_points",
+            "target_percent": "target_percentage",
+            "actual_percent_of_capacity": "actual_percentage",
+            "variance_percent": "variance_percentage",
+            "variance_story_points": "variance_points",
+            "health_status": "status",
+        }
     )
-
-    target_categories = pd.DataFrame({"allocation_category": config.ALLOCATION_CATEGORIES})
-    summary = target_categories.merge(grouped, how="left", on="allocation_category")
-    summary["actual_points"] = summary["actual_points"].fillna(0)
-
-    targets = targets.copy()
-    targets["target_percentage"] = pd.to_numeric(targets["target_percentage"], errors="coerce").fillna(0)
-    summary = summary.merge(targets, how="left", on="allocation_category")
-    summary["target_percentage"] = summary["target_percentage"].fillna(0)
-    summary["target_points"] = summary["target_percentage"] / 100 * sprint_capacity
-    summary["actual_percentage"] = summary["actual_points"] / sprint_capacity * 100
-    summary["variance_percentage"] = summary["actual_percentage"] - summary["target_percentage"]
-    summary["variance_points"] = summary["actual_points"] - summary["target_points"]
-    summary["status"] = summary["variance_percentage"].apply(classify_variance)
 
     return summary.sort_values("allocation_category").reset_index(drop=True)
 
@@ -130,6 +222,8 @@ def issue_editor_rows(issues: pd.DataFrame) -> pd.DataFrame:
 
 
 def classify_variance(variance_percentage: float) -> str:
+    if pd.isna(variance_percentage):
+        return "unmapped"
     absolute_variance = abs(variance_percentage)
     if absolute_variance <= 2:
         return "On target"
@@ -213,4 +307,20 @@ def _normalize_mapping_level(value: object) -> str:
 def _normalize_allocation_category(value: object) -> str:
     text = str(value).strip()
     return text if text in VALID_ALLOCATION_CATEGORIES else "Unmapped"
+
+
+def _health_status(row: pd.Series) -> str:
+    if row.get("allocation_category") == "Unmapped" or pd.isna(row.get("variance_percent")):
+        return "unmapped"
+
+    variance = float(row["variance_percent"])
+    if abs(variance) <= 5:
+        return "healthy"
+    if 5 < variance <= 15:
+        return "watch"
+    if variance > 15:
+        return "over target"
+    if variance < -10:
+        return "under target"
+    return "watch"
 

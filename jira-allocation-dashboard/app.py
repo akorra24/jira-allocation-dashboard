@@ -367,7 +367,8 @@ def render_scorecards(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
     assigned_points = assigned_issues["story_points"].sum()
     total_points = issues["story_points"].sum()
     unassigned_points = total_points - assigned_points
-    largest_variance = summary.iloc[summary["variance_percentage"].abs().idxmax()]
+    variance_rows = summary[summary["variance_percentage"].notna()]
+    largest_variance = variance_rows.iloc[variance_rows["variance_percentage"].abs().idxmax()]
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total sprint points", f"{total_points:.0f}")
@@ -424,11 +425,12 @@ def render_charts(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
         fig.update_traces(textposition="inside", textinfo="percent+label")
         st.plotly_chart(fig, use_container_width=True)
 
-    heatmap_values = summary[["variance_percentage"]].T
+    heatmap_summary = summary[summary["variance_percentage"].notna()]
+    heatmap_values = heatmap_summary[["variance_percentage"]].T
     fig = go.Figure(
         data=go.Heatmap(
             z=heatmap_values.values,
-            x=summary["allocation_category"],
+            x=heatmap_summary["allocation_category"],
             y=["Variance"],
             colorscale=[
                 [0.0, LOOKER_COLORS["red"]],
@@ -472,9 +474,9 @@ def render_tables(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
 
     formatted_summary = summary.copy()
     for column in ["target_percentage", "actual_percentage", "variance_percentage"]:
-        formatted_summary[column] = formatted_summary[column].map(lambda value: f"{value:.1f}%")
+        formatted_summary[column] = formatted_summary[column].map(format_percent)
     for column in ["target_points", "actual_points", "variance_points"]:
-        formatted_summary[column] = formatted_summary[column].map(lambda value: f"{value:.1f}")
+        formatted_summary[column] = formatted_summary[column].map(format_number)
 
     st.dataframe(
         formatted_summary[
@@ -514,6 +516,18 @@ def render_export(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
         file_name="sprint_allocation_dashboard.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+def format_percent(value: object) -> str:
+    if pd.isna(value):
+        return "-"
+    return f"{float(value):.1f}%"
+
+
+def format_number(value: object) -> str:
+    if pd.isna(value):
+        return "-"
+    return f"{float(value):.1f}"
 
 
 if __name__ == "__main__":
