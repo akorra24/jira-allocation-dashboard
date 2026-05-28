@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import date
-from io import BytesIO
+import re
+from pathlib import Path
 
+from openpyxl.styles import Alignment, Font, PatternFill
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -66,7 +68,7 @@ def main() -> None:
     if page == "Dashboard":
         render_dashboard_page(sprint_name, mapped_issues, summary, dashboard_filters)
     elif page == "Settings / Export":
-        render_settings_export_page(mapped_issues, summary)
+        render_settings_export_page(sprint_name, mapped_issues, summary)
 
 
 def render_dashboard_page(
@@ -152,7 +154,7 @@ def render_ticket_mapping_page(default_sprint_name: str) -> None:
     render_tables(summary, preview_issues)
 
 
-def render_settings_export_page(issues: pd.DataFrame, summary: pd.DataFrame) -> None:
+def render_settings_export_page(sprint_name: str, issues: pd.DataFrame, summary: pd.DataFrame) -> None:
     st.subheader("Settings / Export")
     st.caption("Review active configuration and export the current sprint allocation snapshot.")
 
@@ -177,7 +179,7 @@ def render_settings_export_page(issues: pd.DataFrame, summary: pd.DataFrame) -> 
         st.write("**Allocation targets**")
         st.dataframe(analytics.load_sprint_targets(), hide_index=True, use_container_width=True)
 
-    render_export(summary, issues)
+    render_export(sprint_name, summary, issues)
 
 
 def render_header() -> None:
@@ -964,18 +966,168 @@ def render_tables(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
         st.dataframe(analytics.issue_editor_rows(issues), hide_index=True, use_container_width=True)
 
 
-def render_export(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
-    export_bytes = BytesIO()
-    with pd.ExcelWriter(export_bytes, engine="openpyxl") as writer:
-        summary.to_excel(writer, index=False, sheet_name="Allocation Summary")
-        issues.to_excel(writer, index=False, sheet_name="Issue Detail")
+def render_export(sprint_name: str, summary: pd.DataFrame, issues: pd.DataFrame) -> None:
+    st.subheader("Export files")
+    st.caption("Exports include sprint allocation and ticket data only. Jira credentials and environment variables are excluded.")
 
-    st.download_button(
-        "Download Excel snapshot",
-        data=export_bytes.getvalue(),
-        file_name="sprint_allocation_dashboard.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if st.button("Generate export files", type="primary"):
+        st.session_state["export_paths"] = export_sprint_artifacts(sprint_name, summary, issues)
+        st.success(f"Export files written to {config.OUTPUTS_DIR.relative_to(config.APP_DIR)}.")
+
+    export_paths = st.session_state.get("export_paths")
+    if not export_paths:
+        st.info('Click "Generate export files" to write CSV and Excel files to the outputs folder.')
+        return
+
+    for label, path in export_paths.items():
+        path = Path(path)
+        if not path.exists():
+            continue
+        st.download_button(
+            label=f"Download {export_label(label)}",
+            data=path.read_bytes(),
+            file_name=path.name,
+            mime=export_mime_type(path),
+            key=f"download_{label}",
+        )
+
+
+def export_sprint_artifacts(
+    sprint_name: str,
+    summary: pd.DataFrame,
+    issues: pd.DataFrame,
+    output_dir: Path = config.OUTPUTS_DIR,
+) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    slug = slugify_filename(sprint_name or "current-sprint")
+    base_name = f"{slug}_{timestamp}"
+
+    ticket_detail = prepare_ticket_detail_export(issues)
+    allocation_summary = prepare_allocation_summary_export(summary)
+    sprint_history = analytics.load_sprint_history()
+
+    ticket_detail_path = output_dir / f"{base_name}_ticket_detail.csv"
+    allocation_summary_path = output_dir / f"{base_name}_allocation_summary.csv"
+    sprint_history_path = output_dir / f"{base_name}_sprint_history.csv"
+    excel_path = output_dir / f"{base_name}_current_sprint_summary.xlsx"
+
+    ticket_detail.to_csv(ticket_detail_path, index=False)
+    allocation_summary.to_csv(allocation_summary_path, index=False)
+    sprint_history.to_csv(sprint_history_path, index=False)
+    write_formatted_excel_export(excel_path, allocation_summary, ticket_detail)
+
+    return {
+        "ticket_detail_csv": ticket_detail_path,
+        "allocation_summary_csv": allocation_summary_path,
+        "sprint_history_csv": sprint_history_path,
+        "current_sprint_excel": excel_path,
+    }
+
+
+def prepare_ticket_detail_export(issues: pd.DataFrame) -> pd.DataFrame:
+    issues = analytics.ensure_issue_schema(issues)
+    columns = [
+        "ticket_key",
+        "summary",
+        "issue_type",
+        "story_points",
+        "epic_key",
+        "epic_name",
+        "status",
+        "assignee",
+        "allocation_category",
+        "notes",
+    ]
+    return issues[columns].copy()
+
+
+def prepare_allocation_summary_export(summary: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "allocation_category",
+        "target_percentage",
+        "target_points",
+        "actual_points",
+        "actual_percentage",
+        "variance_percentage",
+        "variance_points",
+        "ticket_count",
+        "status",
+    ]
+    available_columns = [column for column in columns if column in summary.columns]
+    return summary[available_columns].copy()
+
+
+def write_formatted_excel_export(
+    path: Path,
+    allocation_summary: pd.DataFrame,
+    ticket_detail: pd.DataFrame,
+) -> None:
+    excel_summary = prepare_excel_dataframe(allocation_summary)
+    excel_ticket_detail = prepare_excel_dataframe(ticket_detail)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        excel_summary.to_excel(writer, index=False, sheet_name="Allocation Summary")
+        excel_ticket_detail.to_excel(writer, index=False, sheet_name="Ticket Detail")
+        format_excel_worksheet(writer.book["Allocation Summary"], allocation_summary.columns)
+        format_excel_worksheet(writer.book["Ticket Detail"], ticket_detail.columns)
+
+
+def prepare_excel_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    excel_df = df.copy()
+    for column in percent_columns(excel_df.columns):
+        excel_df[column] = pd.to_numeric(excel_df[column], errors="coerce") / 100
+    return excel_df
+
+
+def format_excel_worksheet(worksheet, columns: pd.Index) -> None:
+    header_fill = PatternFill(fill_type="solid", fgColor="F1F3F4")
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    worksheet.freeze_panes = "A2"
+
+    percent_column_names = set(percent_columns(columns))
+    point_column_names = set(point_columns(columns))
+    for column_index, column_name in enumerate(columns, start=1):
+        column_letter = worksheet.cell(row=1, column=column_index).column_letter
+        max_length = len(str(column_name))
+        for cell in worksheet[column_letter]:
+            if cell.row > 1:
+                if column_name in percent_column_names:
+                    cell.number_format = "0%"
+                elif column_name in point_column_names:
+                    cell.number_format = "0.0"
+            max_length = max(max_length, len(str(cell.value)) if cell.value is not None else 0)
+        worksheet.column_dimensions[column_letter].width = min(max_length + 2, 60)
+
+
+def percent_columns(columns) -> list[str]:
+    return [column for column in columns if "percent" in str(column).lower() or "percentage" in str(column).lower()]
+
+
+def point_columns(columns) -> list[str]:
+    return [column for column in columns if "point" in str(column).lower() or str(column).lower().endswith("_sp")]
+
+
+def slugify_filename(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-").lower()
+    return slug or "current-sprint"
+
+
+def export_label(label: str) -> str:
+    return {
+        "ticket_detail_csv": "ticket detail CSV",
+        "allocation_summary_csv": "allocation summary CSV",
+        "sprint_history_csv": "sprint history CSV",
+        "current_sprint_excel": "current sprint Excel summary",
+    }.get(label, label)
+
+
+def export_mime_type(path: Path) -> str:
+    if path.suffix == ".xlsx":
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return "text/csv"
 
 
 def format_unsigned_percent(value: object) -> str:
